@@ -966,6 +966,7 @@ struct Prefill::Impl {
     // this layout's GU, H and Xq are the fused path's (moe_bufs' `fused`), so a layer that runs MMQ or the FP16 path may
     // only write stream_all_min() - 1 of its rows into them; fused_layout() keeps the two in step (#583, #954)
     bool fused_bufs = false;
+    bool expert_scratch = false;   // opt-in: only one FP16 expert owns Xs/GU/Hh at a time
     std::unique_ptr<Stager> stager;          // the unpinned experts' host copies (step 4)
     cudaEvent_t copied[RING_MAX] = {}, used[RING_MAX] = {};
     bool stage_live[RING_MAX] = {};
@@ -1263,15 +1264,48 @@ MoeBufs moe_bufs(size_t T, int64_t n_expert, bool fused) {
             std::max(mmq::q8_bytes((int64_t) (ts * K), N), fused::act_bytes((int64_t) T, N)),
             mmq::q8_bytes((int64_t) (ts * K), 640)};
 }
+// Restart-only prototype: each FP16 expert keeps its original GEMM dimensions, but its
+// input and intermediate rows reuse the same bases. Dm stays T*K rows for ordered combine.
+bool expert_scratch_requested() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_PREFILL_EXPERT_SCRATCH"); return e && e[0] == '1'; }();
+    return on;
+}
+const char* expert_scratch_rejection(int64_t n_expert, bool fused) {
+#if defined(STRATA_GPU_METAL) || defined(STRATA_USE_HIP) || defined(__HIPCC__) || defined(STRATA_HIP_GFX906)
+    (void) n_expert; (void) fused;
+    return "the expert-local scratch prototype requires the CUDA FP16 prompt path";
+#else
+    if (n_expert != NE) return "expert-local scratch requires the 512-expert route kernel";
+    if (fused) return "expert-local scratch cannot use the fused MoE layout";
+    const MmqPlan& mp = mmq_plan();
+    if (mp.any || !mp.fallback) return "expert-local scratch requires FP16 experts in every layer (no MMQ/fused grouping)";
+    if (pf_wmma()) return "expert-local scratch cannot use grouped WMMA";
+    if (core::peer_portable()) return "expert-local scratch cannot use peer-device layouts";
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (strata::kernels::cpu::hadamard_spec().any() ||
+        (lay.native && std::any_of(lay.fmt.begin(), lay.fmt.end(), [](const auto& f) { return f.had_gu || f.had_d; })))
+        return "expert-local scratch cannot use Hadamard-folded (APR) experts";
+    return nullptr;
+#endif
+}
+bool expert_scratch_active(int64_t n_expert, bool fused) {
+    return expert_scratch_requested() && expert_scratch_rejection(n_expert, fused) == nullptr;
+}
+bool dbg_nan() {
+    static const bool on = std::getenv("STRATA_DBG_NAN") != nullptr;
+    return on;
+}
 uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
     const MmqPlan& mp = mmq_plan();
     const MoeBufs mb = moe_bufs(T, n_expert, fused);
+    const bool local = expert_scratch_active(n_expert, fused);
+    const size_t rows = local ? T : T * K;
     Alloc a; a.count_only = true; bool ok = true;
     a.take<float>(T * n_expert, ok); a.take<float>(T * K, ok); a.take<int32_t>(T * K, ok); a.take<int32_t>(T * K, ok);
     a.take<int32_t>(T * K, ok);
-    if (fp16_bufs(mp)) a.take<uint16_t>(T * K * N, ok);
-    a.take<float>(mb.gu, ok);
-    if (fp16_bufs(mp)) a.take<uint16_t>(T * K * 640, ok);
+    if (fp16_bufs(mp)) a.take<uint16_t>(rows * N, ok);
+    a.take<float>(local ? rows * 1280 : mb.gu, ok);
+    if (fp16_bufs(mp)) a.take<uint16_t>(rows * 640, ok);
     a.take<float>(T * K * N, ok); a.take<float>(T * 640, ok);
     a.take<float>(T * 640, ok); a.take<uint16_t>(T * 640, ok); a.take<float>(T * N, ok); a.take<float>(T, ok);
     if (mp.any) {
@@ -1362,6 +1396,17 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                    core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
                    void* stream, std::string& err, void* borrow, uint64_t borrow_bytes, bool borrow_spill) {
     Impl& m = *impl_;
+    if (expert_scratch_requested()) {
+        const char* why = expert_scratch_rejection(g.n_expert, false);
+        if (why == nullptr && (chunk <= 0 || stage_lb_ != 0 || (stage_le_ >= 0 && stage_le_ != g.n_layers) ||
+                               next_ != nullptr || helper_ != nullptr || hand_in_ != nullptr || m.pp || m.help_pp))
+            why = "expert-local scratch requires a positive chunk and a single full-model stage without a peer/helper";
+        if (why != nullptr) {
+            err = std::string("prefill: ") + why;
+            std::fprintf(stderr, "strata: prompt expert scratch requested=1 actual=unavailable: %s\n", why);
+            return false;
+        }
+    }
 #if defined(STRATA_GPU_METAL)
     (void) wt; (void) src; (void) cache; (void) host_res; (void) stream; (void) borrow;
     (void) borrow_bytes;
@@ -1549,6 +1594,12 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
               std::to_string(o.failed_bytes >> 20) + " MiB)";
         return false;
     }
+    if (m.expert_scratch)
+        std::fprintf(stderr, "strata: prompt expert scratch requested=1 actual=expert-local-fp16 capacity_rows=%lld "
+                             "down_rows=%lld region_mib=%.3f\n",
+                     (long long) m.T, (long long) (m.T * K), (double) m.region_bytes / (1024.0 * 1024.0));
+    else
+        std::fprintf(stderr, "strata: prompt expert scratch requested=0 actual=disabled\n");
     { int wd = 0; if (cudaGetDevice(&wd) == cudaSuccess) warm_gemm_libraries(wd); else (void) cudaGetLastError(); }
     return true;
 }
@@ -1604,9 +1655,11 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.logits = c.take<float>(T * m.g->n_expert, ok); m.w = c.take<float>(T * K, ok); m.ids = c.take<int32_t>(T * K, ok);
         m.slot_dev = c.take<int32_t>(T * K, ok); m.src_dev = c.take<int32_t>(T * K, ok);
         const MmqPlan& mp = mmq_plan();
-        m.Xs = fp16_bufs(mp) ? c.take<uint16_t>(T * K * N, ok) : nullptr;
-        m.GU = c.take<float>(mb.gu, ok);
-        m.Hh = fp16_bufs(mp) ? c.take<uint16_t>(T * K * 640, ok) : nullptr;
+        m.expert_scratch = expert_scratch_active(m.g->n_expert, fz);
+        const size_t rows = m.expert_scratch ? T : T * K;
+        m.Xs = fp16_bufs(mp) ? c.take<uint16_t>(rows * N, ok) : nullptr;
+        m.GU = c.take<float>(m.expert_scratch ? rows * 1280 : mb.gu, ok);
+        m.Hh = fp16_bufs(mp) ? c.take<uint16_t>(rows * 640, ok) : nullptr;
         m.Dm = c.take<float>(T * K * N, ok);
         m.sgate = c.take<float>(T * 640, ok); m.sup = c.take<float>(T * 640, ok); m.sh_h = c.take<uint16_t>(T * 640, ok);
         m.shared = c.take<float>(T * N, ok); m.sg = c.take<float>(T, ok);
@@ -1914,6 +1967,10 @@ void peer_had_signs(PeerPrefill& P) {
 
 bool Prefill::set_stage_helper(Prefill* helper, std::string& err) {
     Impl& m = *impl_;
+    if (expert_scratch_requested() && helper != nullptr && helper != this) {
+        err = "prefill: expert-local scratch cannot attach a stage helper";
+        return false;
+    }
     m.help_pp.reset();
     if (helper == nullptr || helper == this || !split_help_env()) return true;
     const Impl& h = *helper->impl_;
@@ -2021,6 +2078,10 @@ bool Prefill::bind_stage_helper(int64_t T) {
 bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err) {
     Impl& m = *impl_;
     if (peer == nullptr || !peer->valid()) { m.pp.reset(); return true; }
+    if (expert_scratch_requested()) {
+        err = "prefill: expert-local scratch cannot attach a peer";
+        return false;
+    }
     // Without P2P the activations and the result rows take the mapped host route of the layer split's helper
     // (STRATA_PF_PEER_HOST=0: refuse as before, the prompt path then stays on the primary)
     const bool host_route_ok = [] { const char* v = std::getenv("STRATA_PF_PEER_HOST"); return v == nullptr || std::atoi(v) != 0; }();
@@ -2580,6 +2641,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
+    if (m.expert_scratch && (!expert_scratch_active(g.n_expert, m.fused_bufs) || LB != 0 || LE != g.n_layers ||
+                             next_ != nullptr || helper_ != nullptr || hand_in_ != nullptr || m.pp || m.help_pp)) {
+        err = "prefill: expert-local scratch no longer matches this execution layout; restart with a supported layout";
+        return false;
+    }
     // The direct successor's future lives on the Prefill object. Intermediate
     // stages therefore do not drain the complete remaining GPU chain here.
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
@@ -3606,6 +3672,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                               "'s expert path at a chunk of " + std::to_string(T) + " tokens";
                         return false;
                     }
+                    if (m.expert_scratch && (use_mmq || fused_l || had_gu || had_d)) {
+                        err = "prefill: expert-local scratch cannot enter this layer's MMQ/fused/APR path";
+                        return false;
+                    }
+                    int64_t local_bad_gu = 0;             // STRATA_DBG_NAN: each local GU is checked before reuse
                     size_t n_order = 0;                   // the routed experts (the debug report; unknown when fused)
                     bool peer_now = false;                // multi-GPU: the peer computed rows of this layer (MMQ path only)
                     // set_cpu_pool: this layer's CPU experts (rows [T * K - rows_cpu, T * K) of Dm), computed on a thread
@@ -3809,6 +3880,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int32_t e = ids_h[(size_t) i];
                             if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
                             ++m.cnt[(size_t) e];
+                        }
+                        if (m.expert_scratch) {
+                            for (int32_t e = 0; e < m.g->n_expert; ++e)
+                                if (m.cnt[(size_t) e] > T) {
+                                    err = "prefill: expert-local scratch count exceeds the chunk for expert " + std::to_string(e);
+                                    return false;
+                                }
                         }
                         if (cpu_maybe) {
                             std::vector<std::pair<int32_t, int32_t>> cand;   // (tokens, expert)
@@ -4065,7 +4143,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     return false;
                                 }
                             }
-                        } else {
+                        } else if (!m.expert_scratch) {
                             gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
                             // APR: Hadamard-folded gate/up take H (s * x); Xs is this layer's private gathered copy
                             // (rotated in fp16 storage, fp32 arithmetic: see the down projection's note below)
@@ -4623,9 +4701,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             if (slot >= 0) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
                             const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
+                            // All consumers use m.cs (including cuBLAS). Reuse only the input/intermediate bases;
+                            // each expert still writes its original absolute rows in the full Dm buffer.
+                            const int64_t s0 = m.expert_scratch ? 0 : o0;
+                            if (m.expert_scratch) {
+                                pt.mark(kPfGather, cs);
+                                gather_rows16(m.mixed_h, m.src_dev + o0, m.Xs, ne, N, m.cs);
+                            }
                             pt.mark(kPfGemmGU, cs);
-                            m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
-                            swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
+                            m.gemm.f16(m.Xs + s0 * N, m.dq_gu[q], m.GU + s0 * 1280, ne, 1280, N);
+                            swiglu_interleaved(m.GU + s0 * 1280, m.Hh + s0 * 640, ne, m.cs);
                             // APR, deliberately in place on the fp16 H: hadamard_rows_f16 reads fp16, runs the
                             // butterflies in fp32 and rounds once on the store, so against an fp32 rotation the only
                             // extra error is the one fp16 rounding of the SwiGLU output before it (~2^-11 relative per
@@ -4634,9 +4719,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             // of types and builds without MMQ (the MMQ path rotates fp32 H).  native_expert_parity
                             // bounds the fp16 rotation against the float one at relative L1 error < 2e-3.  The
                             // gate/up input (Xs above) is handled the same way.
-                            if (had_d) strata::kernels::hadamard_rows_f16(m.Hh + o0 * 640, ne, 640, had_block, had_sh, m.cs);
+                            if (had_d) strata::kernels::hadamard_rows_f16(m.Hh + s0 * 640, ne, 640, had_block, had_sh, m.cs);
                             pt.mark(kPfGemmD, cs);
-                            m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
+                            m.gemm.f16(m.Hh + s0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
+                            if (m.expert_scratch && dbg_nan()) {
+                                // The layer-wide GU no longer exists. Diagnose every expert before the next one
+                                // overwrites it; this synchronous debug-only scan is excluded from speed runs.
+                                std::vector<float> gu((size_t) ne * 1280);
+                                if (cudaMemcpyAsync(gu.data(), m.GU, gu.size() * sizeof(float), cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
+                                    cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                                    err = "prefill: expert-local GU diagnostic readback failed";
+                                    return false;
+                                }
+                                for (float v : gu) local_bad_gu += !std::isfinite(v);
+                            }
                             return true;
                         };
                         if (!stream_all) {
@@ -4747,7 +4843,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs,
                                     use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off ? m.row_sd : nullptr);
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
-                    if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
+                    if (dbg_nan()) {
                         cudaStreamSynchronize(m.cs);
                         auto bad = [&](const float* d, int64_t n) {
                             std::vector<float> h((size_t) n);
@@ -4759,7 +4855,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // (fused: GU and H hold the grouping tables and int8 rows, not floats)
                         // (the CPU's rows, the last rows_cpu of GU and H, are never written by the GPU: not checked)
                         const int64_t gpu_rows = T * K - rows_cpu;
-                        const int64_t bgu = fused_l ? 0 : bad(m.GU, gpu_rows * 1280), bdm = bad(m.Dm, T * K * N),
+                        const int64_t bgu = fused_l ? 0 : m.expert_scratch ? local_bad_gu : bad(m.GU, gpu_rows * 1280),
+                                      bdm = bad(m.Dm, T * K * N),
                                       bbo = bad(m.bo, T * N);
                         const int64_t bh = m.H && !fused_l ? bad(m.H, gpu_rows * 640) : -1;
                         static int64_t reported = -1;
