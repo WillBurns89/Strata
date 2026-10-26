@@ -15,12 +15,34 @@ import sys
 import time
 from types import SimpleNamespace
 
-from batch_test import Engine, QUESTIONS, tokenizer
+from batch_test import Engine, tokenizer
 from cancel_park_capture import capture_native_modules
 
 
-SUFFIX = "\nGive one concise explanation with a concrete example."
+FIXTURES = (
+    ("Write every integer from 1 to 100 in ascending order, separated by a comma and a space. "
+     "Output only the complete sequence: no explanation, summary, or ellipsis.", "1", ", 2, 3, 4, 5, "),
+    ("Write every integer from 101 to 200 in ascending order, separated by a comma and a space. "
+     "Output only the complete sequence: no explanation, summary, or ellipsis.", "101", ", 102, 103, 104, 105, "),
+)
 DEADLINE_SECONDS = 600
+
+
+def build_fixtures(tok):
+    fixtures = []
+    for question, assistant_prefix, suffix_text in FIXTURES:
+        prompt_text = (f"<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
+                       f"<think>\n\n</think>\n\n{assistant_prefix}")
+        prefix = tok.encode(prompt_text, parse_special=True)
+        suffix = tok.encode(suffix_text, parse_special=True)
+        if len(suffix) < 4:
+            raise ValueError("Fixed suffix must contain at least four tokens")
+        if not prefix or len(prefix) + len(suffix) >= 512:
+            raise ValueError("UNSUPPORTED: prompts must remain short single-piece admissions")
+        fixtures.append({"question": question, "assistant_prefix": assistant_prefix,
+                         "prompt_text": prompt_text, "prefix_tokens": prefix,
+                         "suffix_text": suffix_text, "suffix_tokens": suffix})
+    return fixtures
 
 
 def progress_event(fields, row, batch_telemetry):
@@ -206,14 +228,8 @@ def main():
                                        for name in ("batch_test.py", "cancel_park_capture.py", "owner_fork_test.py")}
             validate_profile(cfg)
             tok = tokenizer(cfg["tokenizer"])
-            suffix = tok.encode(SUFFIX, parse_special=True)
-            if len(suffix) < 4:
-                raise ValueError("Fixed suffix must contain at least four tokens")
-            result.update(suffix_text=SUFFIX, suffix_tokens=suffix)
-            prompts = [tok.encode(f"<|im_start|>user\n{q}<|im_end|>\n<|im_start|>assistant\n"
-                                  "<think>\n\n</think>\n\n", parse_special=True) for q in QUESTIONS[:2]]
-            if any(not p or len(p) + len(suffix) >= 512 for p in prompts):
-                raise ValueError("UNSUPPORTED: prompts must remain short single-piece admissions")
+            fixtures = build_fixtures(tok)
+            result.update(fixture_revision="incomplete-integer-sequences-v1", fixtures=fixtures)
             sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
             from serve.server import StrataEngine
             sampling = {**cfg.get("sampling", {}), "temperature": 0, "seed": 1}
@@ -239,7 +255,8 @@ def main():
 
             lines = captured_lines()
             for index, (a, b) in enumerate(((0, 1), (1, 0))):
-                prefix = prompts[index]
+                prefix = fixtures[index]["prefix_tokens"]
+                suffix = fixtures[index]["suffix_tokens"]
                 rows = [{"role": role, "slot": slot, "prompt_tokens": prompt, "tokens": [],
                          "resume": None, "done": None, "admission": None, "terminal": None,
                          "expected_finish": finish}
