@@ -8688,7 +8688,7 @@ int main(int argc, char** argv) {
                          (double) src.resident_bytes() / 1073741824.0,
                          src.complement_pinned() ? "page-locked" : src.locked_bytes() > 0 ? "locked" : "pageable",
                          (long long) xcache.resident(),
-                         o.adapt_every > 0 && o.adapt_swaps > 0 ? "exchange them with the GPU cache (no file reads)"
+                         o.adapt_every > 0 && o.adapt_swaps > 0 ? "exchange them with the GPU cache"
                                                                 : "off");
         } else if (o.resident_soft) {
             std::fprintf(stderr, "strata generate: WARNING: the resident RAM mode does not fit (%s); the experts the "
