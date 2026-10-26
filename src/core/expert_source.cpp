@@ -4311,9 +4311,12 @@ bool FileExpertSource::has_resident(int64_t layer, int64_t expert) const {
     return resident_blob(index) != nullptr;
 }
 
-bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err, int64_t bounce) {
+bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err, int64_t bounce, bool require_pinned) {
     err.clear();
-    if (n <= xstage_cap_) return true;
+    if (n <= xstage_cap_) {
+        if (require_pinned && !xstage_pinned_) { err = "protected adaptation requires pinned exchange staging"; return false; }
+        return true;
+    }
     if (!staged_.empty()) { err = "FileExpertSource: exchange buffers are in use"; return false; }
     if (exchange_storage_.active()) {
         err = "FileExpertSource: reserve maximum exchange capacity before enabling rotation";
@@ -4345,6 +4348,10 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err, int64_t bo
         xstage_pinned_ = true;
     } else {
         (void) cudaGetLastError();
+        if (require_pinned) {
+            err = "protected adaptation: pinned exchange allocation failed; pageable fallback refused";
+            return false;
+        }
         p = std::malloc(total);
         xstage_pinned_ = false;
         if (p == nullptr) { err = "FileExpertSource: cannot allocate the exchange buffers"; return false; }
@@ -4378,6 +4385,11 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err, int64_t bo
             std::fprintf(stderr, "FileExpertSource: exchange rotation unavailable; retaining copy path: %s\n", reason.c_str());
     }
     return true;
+}
+
+uint64_t FileExpertSource::exchange_metadata_capacity_bytes() const {
+    return (uint64_t) override_.capacity() * sizeof(override_[0]) +
+           (uint64_t) staged_.capacity() * sizeof(Exchange) + (uint64_t) soft_in_.capacity() * sizeof(size_t);
 }
 
 uint8_t* FileExpertSource::exchange_buffer(int64_t q, int64_t layer) const {

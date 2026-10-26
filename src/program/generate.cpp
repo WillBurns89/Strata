@@ -364,7 +364,7 @@ struct SwapHome {
 };
 template <class Swap, class Locate>
 bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector<int32_t>& host_res,
-                          int64_t n_expert, std::vector<Swap>& swaps, Locate locate) {
+                          int64_t n_expert, std::vector<Swap>& swaps, Locate locate, size_t* temporary_capacity = nullptr) {
     if (!src.complement_ready() || swaps.empty()) return true;
     struct Staged { int32_t layer, in, out; int64_t q; };
     std::vector<Staged> staged;
@@ -407,9 +407,274 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
                 return false;
             }
     }
+    if (temporary_capacity) *temporary_capacity = staged.capacity() * sizeof(Staged) + used.capacity() * sizeof(SwapHome) +
+        (kept.capacity() + swaps.capacity()) * sizeof(Swap);
     swaps.swap(kept);
     return true;
 }
+
+// Opt-in, synchronous protected-loan adaptation. The authoritative GPU map is host_res;
+// ExpertCache's admission table intentionally does not follow the ordinary adaptive tier.
+// This journal proves ownership metadata, not expert bytes or GPU-content readback.
+class ProtectedLendState {
+    struct Change { int32_t layer, in, out, slot; uint64_t in_before, out_before; };
+    struct Counts { uint64_t unique_n = 0, unique_b = 0, backup_n = 0, backup_b = 0; } base_, now_;
+    strata::core::FileExpertSource* src_ = nullptr;
+    const std::vector<int32_t>* gpu_ = nullptr;
+    int64_t layers_ = 0, experts_ = 0, slots_ = 0, first_ = 0;
+    std::vector<int32_t> owner_, slot_layer_;
+    std::vector<std::pair<uint64_t, size_t>> ram_order_;
+    std::vector<Change> changes_;
+    std::string record_;
+    uint64_t generation_ = 0, round_ = 0, loan_generation_ = 0, loan_id_ = 0, loan_hash_ = 0;
+    uint64_t file_seen_ = 0, blocked_ = 0, selection_bytes_ = 0;
+    uint64_t protected_committed_ = 0, file_committed_ = 0, total_committed_ = 0;
+    bool loan_ = false;
+#if defined(_WIN32)
+    HANDLE file_ = INVALID_HANDLE_VALUE;
+#endif
+    static constexpr uint64_t absent = ~0ull;
+
+    template<class... A> void add(const char* format, A... args) {
+        char b[768];
+        const int n = std::snprintf(b, sizeof b, format, args...);
+        if (n < 0 || n >= (int) sizeof b || record_.size() + (size_t) n > 32768)
+            fail("bounded journal record overflow");
+        record_.append(b, (size_t) n);
+    }
+    void start(const char* kind) {
+        record_.clear();
+        add("{\"kind\":\"%s\",\"generation\":%llu,\"round\":%llu", kind,
+            (unsigned long long) generation_, (unsigned long long) round_);
+    }
+    void publish(bool flush = false) {
+        add("}\n");
+#if defined(_WIN32)
+        size_t at = 0;
+        while (at < record_.size()) {
+            DWORD written = 0;
+            if (!WriteFile(file_, record_.data() + at, (DWORD) (record_.size() - at), &written, nullptr) || written == 0)
+                fail("journal WriteFile failed");
+            at += written;
+        }
+        if (flush && !FlushFileBuffers(file_)) fail("journal flush failed");
+#else
+        (void) flush;
+        fail("journal requires Windows");
+#endif
+    }
+    uint64_t map_hash() const {
+        // FNV-1a over little-endian int32 host_res then uint64 resident offsets, in model index order.
+        uint64_t h = 14695981039346656037ull;
+        auto word = [&](uint64_t v, int n) { for (int j = 0; j < n; ++j) { h ^= (uint8_t) (v >> (8 * j)); h *= 1099511628211ull; } };
+        for (int32_t v : *gpu_) word((uint32_t) v, 4);
+        for (uint64_t v : src_->resident_offsets()) word(v, 8);
+        return h;
+    }
+    void counts_record() {
+        add(",\"state_fnv1a64\":\"%016llx\",\"unique_count\":%llu,\"unique_bytes\":%llu,"
+            "\"backup_count\":%llu,\"backup_bytes\":%llu,\"file_candidates\":%llu,\"blocked_candidates\":%llu",
+            (unsigned long long) map_hash(), (unsigned long long) now_.unique_n, (unsigned long long) now_.unique_b,
+            (unsigned long long) now_.backup_n, (unsigned long long) now_.backup_b,
+            (unsigned long long) file_seen_, (unsigned long long) blocked_);
+        add(",\"protected_committed\":%llu,\"file_to_front_committed\":%llu,\"total_committed\":%llu",
+            (unsigned long long) protected_committed_, (unsigned long long) file_committed_,
+            (unsigned long long) total_committed_);
+    }
+    void audit(bool initial = false) {
+        if (!active()) return;
+        const auto& offsets = src_->resident_offsets();
+        if (gpu_->size() != (size_t) (layers_ * experts_) || offsets.size() != gpu_->size() ||
+            src_->pinned_bytes() != src_->resident_bytes()) fail("map dimensions or pinned arena changed");
+        std::fill(owner_.begin(), owner_.end(), -1);
+        for (size_t i = 0; i < gpu_->size(); ++i) {
+            const int32_t s = (*gpu_)[i];
+            if (s == -1) continue;
+            if (s < 0 || s >= slots_ || owner_[(size_t) s] >= 0) fail("invalid or duplicate live GPU slot");
+            owner_[(size_t) s] = (int32_t) i;
+            if (initial) slot_layer_[(size_t) s] = (int32_t) (i / (size_t) experts_);
+            if (slot_layer_[(size_t) s] != (int32_t) (i / (size_t) experts_)) fail("cross-layer GPU replacement");
+        }
+        if (std::find(owner_.begin(), owner_.end(), -1) != owner_.end()) fail("committed GPU map has an unowned slot");
+        now_ = {};
+        ram_order_.clear();
+        for (size_t i = 0; i < offsets.size(); ++i) {
+            const int32_t s = (*gpu_)[i];
+            if (s >= first_ && (offsets[i] == absent || !src_->pinned(i / experts_, i % experts_)))
+                fail("protected GPU occupant lacks a pinned RAM backup");
+            if (offsets[i] == absent) continue;
+            const uint64_t n = strata::kernels::cpu::expert_layout().blob_bytes((int64_t) (i / experts_));
+            if (s >= 0) {
+                if (s < first_) fail("unprotected GPU slot acquired a duplicate RAM owner");
+                ++now_.backup_n; now_.backup_b += n;
+            } else { ++now_.unique_n; now_.unique_b += n; }
+            if (ram_order_.size() == ram_order_.capacity()) fail("resident metadata capacity changed");
+            ram_order_.emplace_back(offsets[i], i);
+        }
+        std::sort(ram_order_.begin(), ram_order_.end());
+        uint64_t at = 0;
+        for (const auto& p : ram_order_) {
+            const uint64_t n = strata::kernels::cpu::expert_layout().blob_bytes((int64_t) (p.second / experts_));
+            if (p.first != at || at > src_->resident_bytes() || n > src_->resident_bytes() - at)
+                fail("RAM ownership gap, overlap or out-of-range blob");
+            at += n;
+        }
+        if (at != src_->resident_bytes() || now_.backup_n != (uint64_t) (slots_ - first_)) fail("resident coverage changed");
+        if (initial) base_ = now_;
+        else if (now_.unique_n != base_.unique_n || now_.unique_b != base_.unique_b ||
+                 now_.backup_n != base_.backup_n || now_.backup_b != base_.backup_b)
+            fail("logical unique/backup allocation changed");
+    }
+
+public:
+    std::vector<uint8_t> victim_used; // bounded reusable selector scratch; no per-layer allocation
+    bool active() const { return src_ != nullptr; }
+    [[noreturn]] static void fail(const char* why) {
+        std::fprintf(stderr, "strata protected adaptation: FATAL: %s; refusing further execution\n", why);
+        std::fflush(stderr);
+        std::abort(); // a partial swap cannot be recovered as a request-local error
+    }
+    void init(strata::core::FileExpertSource& src, const std::vector<int32_t>& gpu,
+              int64_t layers, int64_t experts, int64_t slots, int64_t first, const std::string& map_file) {
+        src_ = &src; gpu_ = &gpu; layers_ = layers; experts_ = experts; slots_ = slots; first_ = first;
+        if (first < 0 || first >= slots || src.resident_lent_slots() != slots - first || !src.exchange_pinned())
+            fail("incomplete startup protection or unpinned exchange staging");
+        owner_.assign((size_t) slots, -1); slot_layer_.assign((size_t) slots, -1);
+        size_t n = 0; for (uint64_t v : src.resident_offsets()) n += v != absent;
+        ram_order_.reserve(n); changes_.reserve(96); victim_used.reserve((size_t) experts); record_.reserve(32768);
+        audit(true);
+#if defined(_WIN32)
+        const auto path = std::filesystem::u8path(map_file + ".adapt.jsonl");
+        file_ = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file_ == INVALID_HANDLE_VALUE) fail("cannot exclusively create adaptation journal");
+#endif
+        start("begin");
+        const size_t metadata = owner_.capacity() * sizeof(int32_t) + slot_layer_.capacity() * sizeof(int32_t) +
+            ram_order_.capacity() * sizeof(ram_order_[0]) + changes_.capacity() * sizeof(Change) +
+            victim_used.capacity() * sizeof(uint8_t) + record_.capacity();
+        add(",\"schema\":1,\"protected_first\":%lld,\"slot_end\":%lld,\"metadata_capacity_bytes\":%llu,"
+            "\"exchange_bytes\":%llu,\"stack_record_bytes\":768",
+            (long long) first_, (long long) slots_, (unsigned long long) metadata,
+            (unsigned long long) src.exchange_allocation_bytes());
+        counts_record(); publish(true);
+        std::fprintf(stderr, "strata protected adaptation: %lld backed slots, metadata vector/string capacity %llu bytes "
+                             "+ 768-byte format stack; pinned exchange staging %llu bytes; admission TSV is generation 0 only\n",
+                     (long long) (slots_ - first_), (unsigned long long) metadata,
+                     (unsigned long long) src.exchange_allocation_bytes());
+    }
+    bool protected_slot(int32_t slot) const { return active() && slot >= first_; }
+    void file_candidate() { ++file_seen_; }
+    void blocked_candidate() { ++blocked_; }
+    void selection_begin() {
+        if (!active()) return;
+        if (loan_ || !changes_.empty()) fail("adaptive selection during loan or uncommitted round");
+        if (round_ == ~0ull) fail("round overflow");
+        ++round_; audit();
+    }
+    template<class Swaps> void prepare(const Swaps& swaps, size_t workspace) {
+        if (!active()) return;
+        selection_bytes_ = std::max<uint64_t>(selection_bytes_, workspace);
+        if (swaps.size() > changes_.capacity()) fail("round exceeds bounded delta capacity");
+        const auto& offsets = src_->resident_offsets();
+        for (const auto& s : swaps) {
+            const size_t in = (size_t) s.layer * experts_ + s.in, out = (size_t) s.layer * experts_ + s.out;
+            const int32_t slot = (*gpu_)[out];
+            if ((*gpu_)[in] >= 0 || slot < 0 || (protected_slot(slot) && offsets[in] == absent))
+                fail("selected swap violates protected eligibility");
+            changes_.push_back({s.layer, s.in, s.out, slot, offsets[in], offsets[out]});
+        }
+        start(changes_.empty() ? "empty" : "prepare");
+        add(",\"selector_and_staging_temporary_peak_bytes\":%llu,\"exchange_metadata_capacity_bytes\":%llu,\"swaps\":[",
+            (unsigned long long) selection_bytes_, (unsigned long long) src_->exchange_metadata_capacity_bytes());
+        for (size_t j = 0; j < changes_.size(); ++j) {
+            const auto& x = changes_[j];
+            add("%s[%d,%d,%d,%d,%llu,%llu]", j ? "," : "", x.layer, x.in, x.out, x.slot,
+                (unsigned long long) x.in_before, (unsigned long long) x.out_before);
+        }
+        add("]"); counts_record(); publish();
+    }
+    void commit(size_t n) {
+        if (!active()) return;
+        if (loan_ || n == 0 || n != changes_.size() || generation_ == ~0ull) fail("invalid committed round boundary");
+        const auto& offsets = src_->resident_offsets();
+        for (const auto& x : changes_) {
+            const size_t in = (size_t) x.layer * experts_ + x.in, out = (size_t) x.layer * experts_ + x.out;
+            if ((*gpu_)[in] != x.slot || (*gpu_)[out] != -1) fail("published GPU map differs from prepared delta");
+            const bool backed = x.out_before != absent;
+            const uint64_t want_in = backed ? x.in_before : absent;
+            const uint64_t want_out = backed ? x.out_before : x.in_before;
+            if (offsets[in] != want_in || offsets[out] != want_out) fail("committed RAM owners differ from exact transition");
+        }
+        audit(); ++generation_;
+        for (const auto& x : changes_) {
+            protected_committed_ += protected_slot(x.slot);
+            file_committed_ += x.in_before == absent;
+            ++total_committed_;
+        }
+        start("commit"); add(",\"swaps\":[");
+        for (size_t j = 0; j < changes_.size(); ++j) {
+            const auto& x = changes_[j];
+            add("%s[%d,%d,%d,%d,%llu,%llu]", j ? "," : "", x.layer, x.in, x.out, x.slot,
+                (unsigned long long) offsets[(size_t) x.layer * experts_ + x.in],
+                (unsigned long long) offsets[(size_t) x.layer * experts_ + x.out]);
+        }
+        add("]"); counts_record(); publish(); changes_.clear();
+    }
+    void before_loan(int32_t first) {
+        if (!active()) return;
+        if (!changes_.empty() || first < first_ || first >= slots_ || (loan_ && loan_generation_ != generation_))
+            fail("actual prompt loan is outside backed coverage or crosses an adaptive generation");
+        audit(); // also covers relending after the previous loan's copies have landed
+        const uint64_t current_hash = map_hash();
+        if (loan_ && current_hash != loan_hash_) fail("relend changed the previous loan's expert identities or RAM offsets");
+        loan_hash_ = current_hash;
+        if (loan_id_ == ~0ull) fail("loan counter overflow");
+        const bool relend = loan_;
+        loan_ = true; loan_generation_ = generation_; ++loan_id_;
+        start(relend ? "relend" : "loan");
+        add(",\"loan_id\":%llu,\"first\":%d,\"slot_end\":%lld,\"expected_restore_fnv1a64\":\"%016llx\"",
+            (unsigned long long) loan_id_, first, (long long) slots_, (unsigned long long) loan_hash_);
+        counts_record(); publish();
+    }
+    void restored() {
+        if (!active()) return;
+        if (!loan_ || loan_generation_ != generation_) fail("restore has no matching unchanged loan generation");
+        audit();
+        if (map_hash() != loan_hash_) fail("refill changed the loan's expert identities or RAM offsets");
+        loan_ = false;
+        start("restore"); add(",\"loan_id\":%llu,\"expected_restore_fnv1a64\":\"%016llx\"",
+                              (unsigned long long) loan_id_, (unsigned long long) loan_hash_);
+        counts_record(); publish();
+    }
+    void finish() {
+        if (!active()) return;
+        if (loan_ || !changes_.empty()) fail("shutdown with unfinished loan or round");
+        audit();
+        // Exact final arrays independently challenge delta replay; bounded chunks avoid a large temporary string.
+        for (int which = 0; which < 2; ++which) {
+            const size_t size = which == 0 ? gpu_->size() : src_->resident_offsets().size();
+            for (size_t at = 0; at < size; at += 256) {
+                start(which == 0 ? "snapshot_gpu" : "snapshot_ram");
+                add(",\"start\":%llu,\"values\":[", (unsigned long long) at);
+                for (size_t i = at; i < std::min(at + 256, size); ++i) {
+                    if (which == 0) add("%s%d", i == at ? "" : ",", (*gpu_)[i]);
+                    else add("%s%llu", i == at ? "" : ",", (unsigned long long) src_->resident_offsets()[i]);
+                }
+                add("]"); publish();
+            }
+        }
+        start("complete"); counts_record(); publish(true);
+#if defined(_WIN32)
+        if (!CloseHandle(file_)) fail("journal close failed");
+        file_ = INVALID_HANDLE_VALUE;
+#endif
+    }
+    ~ProtectedLendState() {
+#if defined(_WIN32)
+        if (file_ != INVALID_HANDLE_VALUE) CloseHandle(file_); // no completion claim on an error return
+#endif
+    }
+};
 
 struct Options {
     std::string pack = "pack/full";
@@ -2767,6 +3032,13 @@ int main(int argc, char** argv) {
         }
     }
     // Restart-only placement experiment. Parse before loading weights; never turn a typo into a zero reserve.
+    const char* protected_adapt_env = std::getenv("STRATA_RESIDENT_LEND_ADAPT");
+    const bool protected_adapt = protected_adapt_env != nullptr && std::strcmp(protected_adapt_env, "1") == 0;
+    if (protected_adapt_env != nullptr && std::strcmp(protected_adapt_env, "0") != 0 && !protected_adapt) {
+        std::fprintf(stderr, "strata: STRATA_RESIDENT_LEND_ADAPT must be 0 or 1\n");
+        return 2;
+    }
+    int64_t protected_initial_lend_first = -1;
     uint64_t resident_lend_reserve_bytes = 0;
     if (const char* v = std::getenv("STRATA_RESIDENT_LEND_RESERVE_MIB")) {
         uint64_t mib = 0;
@@ -2785,6 +3057,19 @@ int main(int argc, char** argv) {
     }
     const char* resident_map_env = std::getenv("STRATA_RESIDENT_MAP_FILE");
     const std::string resident_map_file = resident_map_env != nullptr ? resident_map_env : "";
+    if (protected_adapt) {
+        bool unsupported = false;
+        for (const char* name : {"STRATA_ADAPT_OVERLAP", "STRATA_ADAPT_OVERLAP_RESIDENT", "STRATA_ADAPT_NOWAIT",
+                                "STRATA_BATCH_MTP", "STRATA_FS_SLOTS"})
+            if (const char* v = std::getenv(name)) unsupported = unsupported || std::strcmp(v, "0") != 0;
+        if (const char* v = std::getenv("STRATA_ADAPT_LAG")) unsupported = unsupported || std::strcmp(v, "1") != 0;
+        if (unsupported || resident_lend_reserve_bytes == 0 || o.batch != 2 || o.batch_mtp ||
+            o.adapt_every <= 0 || o.adapt_swaps <= 0 || o.adapt_swaps > 96 || o.pipeline_windows > 0 || o.batch_groups > 1) {
+            std::fprintf(stderr, "strata: protected adaptation requires a nonzero reserve, --batch 2, synchronous "
+                                 "adaptation with 1..96 swaps, lag 1, and no overlap/nowait/pipeline/groups/batch MTP/Foresight\n");
+            return 2;
+        }
+    }
     const bool fixed_resident_receipt = resident_lend_reserve_bytes > 0 || resident_map_env != nullptr;
     if (fixed_resident_receipt) {
 #if !defined(_WIN32) || defined(STRATA_USE_HIP) || defined(STRATA_GPU_METAL) || defined(STRATA_USE_SYCL)
@@ -2805,7 +3090,7 @@ int main(int argc, char** argv) {
             o.vram_elastic || o.kv_grow || (kg && kg[0] && kg[0] != '0') ||
             !o.layer_split.empty() || o.peer_device >= 0 || remote || o.remote_expert_opt ||
             !o.shared_expert_arena.empty() || (pd && std::strcmp(pd, "0") != 0) ||
-            (o.adapt_every > 0 && o.adapt_swaps > 0) || o.adapt_async || ram_adapt ||
+            (!protected_adapt && o.adapt_every > 0 && o.adapt_swaps > 0) || o.adapt_async || ram_adapt ||
             o.no_prefill_borrow || o.prefill_chunk <= 0 || o.no_pool) {
             std::fprintf(stderr, "strata: reserved loan residency/map capture requires --serve, pinned explicit "
                                  "resident budget larger than reserve, fixed profiled cache on one primary CUDA GPU, "
@@ -8332,6 +8617,13 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: fixed resident admission failed; no retry/fallback: %s\n", err.c_str());
             return 1;
         }
+        if (protected_adapt) {
+            if (lend_from < 0 || src.resident_lent_slots() != xcache.slots() - lend_from) {
+                std::fprintf(stderr, "strata generate: protected adaptation requires full actual startup loan coverage\n");
+                return 1;
+            }
+            protected_initial_lend_first = lend_from;
+        }
         std::string whole_err;
         if (!resident_ok && o.resident_soft) {
             // #467: the whole complement does not fit - keep what does, the hottest by the profile, through the #403
@@ -8387,7 +8679,7 @@ int main(int argc, char** argv) {
             if (o.adapt_async && !src.exchange_pinned())
                 adapt_async_off("the exchange buffers could not be page-locked");
             if (o.adapt_every > 0 && o.adapt_swaps > 0 &&
-                !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
+                !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err, 0, protected_adapt)) {
                 std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
                 return 1;
             }
@@ -10131,6 +10423,10 @@ int main(int argc, char** argv) {
         }
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        ProtectedLendState protected_lend;
+        if (protected_adapt)
+            protected_lend.init(src, host_res, g.n_layers, g.n_expert, xcache.slots(),
+                                protected_initial_lend_first, resident_map_file);
         PcieAuto pcie_auto;
         if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && o.peer_device < 0 && (n_stages == 1 || pcie_auto_split_ok())) {
             const auto& pl = strata::kernels::cpu::expert_layout();
@@ -10192,7 +10488,9 @@ int main(int argc, char** argv) {
         int pending_age = 0;   // the windows the pending swaps have waited (adapt_lag)
         std::vector<void*> pin_live;   // the swaps' locked arena pages (pin_blob), unlocked once they have landed
         cudaEvent_t adapt_ev = nullptr;
-        cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+        const cudaError_t event_created = cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+        if (protected_lend.active() && event_created != cudaSuccess)
+            ProtectedLendState::fail("adaptive completion event creation failed");
         // 0.1.43 STRATA_ADAPT_OVERLAP=1 (adapt_overlap above): the single-GPU, plain-RAM-arena decode loop only
         strata::core::AdaptGate agate;
         bool aflipped = false;   // the pending swaps are in the tables and their copies may still be landing
@@ -10273,8 +10571,15 @@ int main(int argc, char** argv) {
         auto apply_pending = [&](bool wait) {
             if (peer.valid()) peer.apply_pending(wait);
             if (pending.empty()) return;
-            if (wait) cudaEventSynchronize(adapt_ev);
-            else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
+            if (wait) {
+                const cudaError_t status = cudaEventSynchronize(adapt_ev);
+                if (protected_lend.active() && status != cudaSuccess) ProtectedLendState::fail("adaptive event synchronization failed");
+            } else {
+                const cudaError_t status = cudaEventQuery(adapt_ev);
+                if (protected_lend.active() && status != cudaSuccess && status != cudaErrorNotReady)
+                    ProtectedLendState::fail("adaptive event query failed");
+                if (status != cudaSuccess) return;
+            }
             for (auto& st : stages)
                 if (st->adapt_live) {
                     if (wait) cudaEventSynchronize(st->adapt_ev);
@@ -10291,13 +10596,19 @@ int main(int argc, char** argv) {
                 for (const auto& pr : pending) drive.d.res_dirty_idx.push_back(pr.first);
                 drive.d.res_dirty = true;
             }
+            const size_t committed = pending.size();
             pending.clear();
             pending_age = 0;
             agate.active.store(false, std::memory_order_release);   // 0.1.43: the copies have landed (STRATA_ADAPT_OVERLAP)
             aflipped = false;
-            if (res_upload() == cudaSuccess) {   // the whole table: the hook has nothing left
+            const cudaError_t publication = res_upload();
+            if (publication == cudaSuccess) {   // the whole table: the hook has nothing left
                 drive.d.res_dirty = false;
                 drive.d.res_dirty_idx.clear();
+            }
+            if (protected_lend.active()) {
+                if (publication != cudaSuccess) ProtectedLendState::fail("adaptive residency upload failed");
+                protected_lend.commit(committed);
             }
         };
         // Where the tier does not wait for its copies (STRATA_ADAPT_NOWAIT=1, STRATA_ADAPT_LAG > 1), its evictions reach
@@ -10405,6 +10716,7 @@ int main(int argc, char** argv) {
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
+            protected_lend.selection_begin();
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
@@ -10423,9 +10735,35 @@ int main(int argc, char** argv) {
                 const size_t nc = std::min(cand.size(), vict.size());
                 std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
                                   [](auto& a, auto& b) { return a.first < b.first; });
-                for (size_t i = 0; i < nc; ++i) {
-                    if (cand[i].first < vict[i].first + o.adapt_min_gain) break;
-                    swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
+                if (protected_lend.active()) {
+                    // Eligibility precedes global truncation. A file-only hot expert can seek an unprotected
+                    // victim even when its old positional partner was protected; never reuse a victim.
+                    std::sort(vict.begin(), vict.end(), [](auto& a, auto& b) { return a.first < b.first; });
+                    protected_lend.victim_used.assign(vict.size(), 0);
+                    for (const auto& c : cand) {
+                        const bool resident = src.has_resident(l, c.second);
+                        if (!resident) protected_lend.file_candidate();
+                        bool profitable = false;
+                        size_t chosen = vict.size();
+                        for (size_t j = 0; j < vict.size(); ++j) {
+                            if (protected_lend.victim_used[j]) continue;
+                            if (c.first < vict[j].first + o.adapt_min_gain) break;
+                            profitable = true;
+                            if (!resident && protected_lend.protected_slot(r[vict[j].second])) continue;
+                            chosen = j; break;
+                        }
+                        if (chosen == vict.size()) {
+                            if (!resident && profitable) protected_lend.blocked_candidate();
+                            continue;
+                        }
+                        protected_lend.victim_used[chosen] = 1;
+                        swaps.push_back({c.first - vict[chosen].first, (int32_t) l, c.second, vict[chosen].second});
+                    }
+                } else {
+                    for (size_t i = 0; i < nc; ++i) {
+                        if (cand[i].first < vict[i].first + o.adapt_min_gain) break;
+                        swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
+                    }
                 }
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
@@ -10446,7 +10784,14 @@ int main(int argc, char** argv) {
                 }
                 return {&xcache, adapt_stream, -1};
             };
-            if (!resident_stage_swaps(src, host_res, g.n_expert, swaps, home_of)) return false;
+            size_t exchange_temporary_capacity = 0;
+            if (!resident_stage_swaps(src, host_res, g.n_expert, swaps, home_of,
+                                      protected_lend.active() ? &exchange_temporary_capacity : nullptr)) {
+                if (protected_lend.active()) ProtectedLendState::fail("adaptive exchange staging failed");
+                return false;
+            }
+            protected_lend.prepare(swaps, std::max(exchange_temporary_capacity, swaps.capacity() * sizeof(Swap)) +
+                (cand.capacity() + vict.capacity()) * sizeof(cand[0]) + drive.d.usage.capacity() * sizeof(float));
             adapt_nswaps += (int64_t) swaps.size();   // (read after the thread's join)
             if (pin_blobs_on()) {   // lock the batch's source pages (a file-backed arena on AMD; see pin_blobs)
                 std::vector<std::pair<uintptr_t, uintptr_t>> spans;
@@ -10507,6 +10852,7 @@ int main(int argc, char** argv) {
                                    gs ? gs->adapt_stream : adapt_stream) != cudaSuccess) {
                     std::fprintf(stderr, "strata serve: adaptive swap copy failed (layer %d, slot %d, pinned %d): %s\n",
                                  (int) s.layer, (int) slot, pin_live.empty() ? 0 : 1, cudaGetErrorString(cudaGetLastError()));
+                    if (protected_lend.active()) ProtectedLendState::fail("adaptive GPU copy failed after round preparation");
                     return false;
                 }
                 if (gs) gs->adapt_live = true;
@@ -10535,9 +10881,13 @@ int main(int argc, char** argv) {
                                                             adapt_stream, dma_mode) != cudaSuccess) {
                 std::fprintf(stderr, "strata serve: adaptive swap copy failed (batched): %s\n",
                              cudaGetErrorString(cudaGetLastError()));
+                if (protected_lend.active()) ProtectedLendState::fail("batched adaptive GPU copy failed");
                 return false;
             }
-            if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
+            if (!swaps.empty()) {
+                const cudaError_t recorded = cudaEventRecord(adapt_ev, adapt_stream);
+                if (protected_lend.active() && recorded != cudaSuccess) ProtectedLendState::fail("adaptive event recording failed");
+            }
             // #2188: hand the copies and their landing signals to the GPU now.  WDDM batches a stream's work until a
             // driver call flushes it, and the verify window only spins on the pinned int (Linux submits at once: no-op)
             if (aov && agate.hland != nullptr && !swaps.empty()) (void) cudaStreamQuery(adapt_stream);
@@ -11779,8 +12129,15 @@ int main(int argc, char** argv) {
             struct AdaptRun {
                 std::thread th;
                 bool ok = true;
-                ~AdaptRun() { if (th.joinable()) th.join(); }   // an error return below still joins it
+                bool protected_mode = false;
+                ~AdaptRun() {
+                    if (th.joinable()) {
+                        th.join();
+                        if (protected_mode) ProtectedLendState::fail("unfinished adaptive worker on a failed batch window");
+                    }
+                }
             } adapt_run;
+            adapt_run.protected_mode = protected_lend.active();
             if (!drive.d.usage.empty() && !ajob && !in_prompt_read && (++ba_window % o.adapt_every) == 0 && pending.empty())
                 adapt_run.th = std::thread([&] { adapt_run.ok = adapt(); });
             // Accept the proposal only when the target picked it and there is room to emit both tokens.
@@ -13487,15 +13844,20 @@ int main(int argc, char** argv) {
                     strata::core::BlobPart parts[3];
                     const int np = refill_parts && !refill_blocking() ? srcp->blob_parts(i / g.n_expert, i % g.n_expert, parts) : 0;
                     if (np > 0) {   // the GGUF read in place: the tensors' pieces go from the mapping to the slot, no assembled copy
-                        if (!p.cache->fill_slot_queued_parts(slot, parts, np, e)) return false;
+                        if (!p.cache->fill_slot_queued_parts(slot, parts, np, e)) {
+                            if (protected_lend.active()) ProtectedLendState::fail("protected refill piece copy failed");
+                            return false;
+                        }
                         host_res[(size_t) i] = slot;
                         continue;
                     }
                     const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
                     const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                     if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
-                                                            : p.cache->fill_slot_queued(slot, b, e, nb)))
+                                                            : p.cache->fill_slot_queued(slot, b, e, nb))) {
+                        if (protected_lend.active()) ProtectedLendState::fail("protected refill copy failed");
                         return false;
+                    }
                     if (!refill_blocking()) srcp->note_async_read(b, nullptr);   // #1237
                     host_res[(size_t) i] = slot;
                 }
@@ -13503,7 +13865,10 @@ int main(int argc, char** argv) {
             };
             auto refill_wait = [&](PfPart& p, std::string& e) -> bool {
                 const strata::core::OnDevice on(p.dev);
-                if (!p.cache->sync_queued(e)) return false;
+                if (!p.cache->sync_queued(e)) {
+                    if (protected_lend.active()) ProtectedLendState::fail("protected refill synchronization failed");
+                    return false;
+                }
 #if defined(_WIN32)
                 // The copies have landed: the file pages touched by the loan need not stay in the working set.
                 for (const auto& [i, slot] : p.lent)
@@ -13535,7 +13900,13 @@ int main(int argc, char** argv) {
                     for (PfPart& p : pf_parts)
                         if (!p.lent.empty() && !refill_one(p, e)) return false;
                 }
-                if (n_parts > 0) res_upload();
+                if (n_parts > 0) {
+                    const cudaError_t uploaded = res_upload();
+                    if (protected_lend.active()) {
+                        if (uploaded != cudaSuccess) ProtectedLendState::fail("restored protected residency upload failed");
+                        protected_lend.restored();
+                    }
+                }
                 if (trace && n_parts > 0) {
                     std::fprintf(stderr, "strata trace: refilled %lld slots on %lld stage(s) in %.1f ms\n",
                                  (long long) n_lent, (long long) n_parts,
@@ -13604,8 +13975,12 @@ int main(int argc, char** argv) {
                                          (long long) need_p, (long long) (p.cache->slots() - p.first));
                         first = (int32_t) (p.cache->slots() - need_p);
                     }
+                    protected_lend.before_loan(first); // actual request range, before workspace or residency changes
                     if (want_p != p.sp->chunk() || first != p.first_now) {
-                        if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
+                        if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) {
+                            if (protected_lend.active()) ProtectedLendState::fail("protected prompt relayout failed");
+                            return false;
+                        }
                         p.first_now = first;
                     }
                     for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
@@ -13621,7 +13996,11 @@ int main(int argc, char** argv) {
                 }
                 for (const PfPart& p : pf_parts)
                     if (p.first >= 0) seg_lend = std::max(seg_lend, p.lent_chunk);
-                if (any) res_upload();
+                if (any) {
+                    const cudaError_t uploaded = res_upload();
+                    if (protected_lend.active() && uploaded != cudaSuccess)
+                        ProtectedLendState::fail("lent protected residency upload failed");
+                }
                 if (trace) {
                     int64_t n_lent = 0;
                     for (const PfPart& p : pf_parts) n_lent += (int64_t) p.lent.size();
@@ -15908,6 +16287,10 @@ int main(int argc, char** argv) {
                 helper_blobs_before = blobs;
                 helper_bytes_before = bytes;
             }
+        }
+        if (protected_lend.active()) {
+            apply_pending(true); // all request-owned workers have joined before returning to this loop
+            protected_lend.finish();
         }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
 #if defined(STRATA_GPU_METAL)

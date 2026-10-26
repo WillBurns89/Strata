@@ -785,10 +785,14 @@ public:
     /// Host room for `n` evicted blobs (page-locked when possible).  Idempotent for the same or a smaller `n`.
     /// `bounce`: how many of the last buffers are only staged through and never hold an exchange (STRATA_EXCHANGE_ROTATE
     /// keeps those in the largest block size alone).
-    bool reserve_exchanges(int64_t n, std::string& err, int64_t bounce = 0);
+    bool reserve_exchanges(int64_t n, std::string& err, int64_t bounce = 0, bool require_pinned = false);
     int64_t exchange_capacity() const { return xstage_cap_; }
     /// The exchange buffers are page-locked (cudaHostAlloc): copies to and from them are asynchronous.
     bool exchange_pinned() const { return xstage_pinned_; }
+    uint64_t exchange_allocation_bytes() const { return (uint64_t) xstage_cap_ * xstage_blob_; }
+    uint64_t exchange_metadata_capacity_bytes() const;
+    /// Admission/generation diagnostics only: inspect at a quiescent boundary, never during an exchange.
+    const std::vector<uint64_t>& resident_offsets() const { return complement_offsets_; }
     /// Buffer `q`.  `layer` >= 0: the buffer an exchange of that layer's experts stages into (STRATA_EXCHANGE_ROTATE with
     /// several block sizes keeps one per size); without it, one that holds any layer's block.
     uint8_t* exchange_buffer(int64_t q, int64_t layer = -1) const;
