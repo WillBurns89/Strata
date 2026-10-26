@@ -97,9 +97,17 @@ struct SessionState {
 /// a candidate range before anything is allocated, which is how the layer-split search prices a placement.
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo = 0,
                        int64_t layer_hi = -1);
+uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo,
+                       int64_t layer_hi, HostKvAllocation host_allocation);
 /// Carves `base` (DEVICE memory) into `s`.  Returns the bytes used.  Same range convention as `session_bytes`.
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
                       int64_t layer_lo = 0, int64_t layer_hi = -1);
+uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
+                      int64_t layer_lo, int64_t layer_hi, HostKvAllocation host_allocation);
+/// Rebind a borrowed main session to an owning slot's FP16 host K/V. Caller must hold an inactive writer lease
+/// and drain all main/MTP/prefill work first. Does not copy K/V or any recurrent/indexer/PLE state. A failure
+/// after publication begins is fatal to the caller; no partially rebound session may execute.
+bool session_bind_host_kv(SessionState& view, const SessionState& owner, std::string& error);
 /// Before the memory `session_init` carved is freed: forgets what points into it from outside the session (the
 /// rope kernels' registered angle table, #280), so a later session never rotates by freed memory.
 void session_release(SessionState& s);

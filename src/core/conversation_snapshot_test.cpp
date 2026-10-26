@@ -110,6 +110,40 @@ bool equal(const ConversationKv& a,const ConversationKv& b) {
     return a.k==b.k && a.v==b.v && a.k_scale==b.k_scale && a.v_scale==b.v_scale && a.pooled==b.pooled;
 }
 
+void borrowed_kv_copy() {
+    Fixture owner(kKvF16,1), destination(kKvF16,1);
+    const int64_t upto=65;
+    std::string err;
+    owner.fill(13);
+    // Save/copy use a nonblocking stream: their caller must finish the setup writes first.
+    cuda_check(cudaDeviceSynchronize());
+    ConversationKv want,untouched,got;
+    check(conversation_kv_save(want,owner.state,owner.g,upto,true,err),"borrowed copy reference");
+    // The view shares ONLY the authoritative host bytes. The indexer and residency map remain the destination's.
+    QsaState view=destination.state;
+    view.host=owner.state.host;
+    view.host_allocation=HostKvAllocation::Borrowed;
+    for (bool queued : {false,true}) {
+        destination.fill(177);
+        cuda_check(cudaMemset(view.page_table,0,(size_t)view.n_pages*sizeof(int32_t)));
+        cuda_check(cudaDeviceSynchronize());
+        check(conversation_kv_copy(owner.state,view,owner.g,upto,true,err,queued),"copy into aliased host K/V");
+        cuda_check(cudaDeviceSynchronize());
+        check(conversation_kv_save(got,view,owner.g,upto,true,err),"read borrowed-copy destination");
+        if (!equal(got,want))
+            std::fprintf(stderr,"borrowed copy queued=%d: K=%d V=%d K-scale=%d V-scale=%d indexer=%d\n",
+                         (int)queued,(int)(got.k==want.k),(int)(got.v==want.v),
+                         (int)(got.k_scale==want.k_scale),(int)(got.v_scale==want.v_scale),(int)(got.pooled==want.pooled));
+        check(equal(got,want),"aliased K/V exact and separate indexer copied");
+        check(conversation_kv_save(untouched,owner.state,owner.g,upto,true,err),"read untouched source owner");
+        check(equal(untouched,want),"borrowed copy leaves source owner unchanged");
+        std::vector<int32_t> table((size_t)view.n_pages);
+        cuda_check(cudaMemcpy(table.data(),view.page_table,table.size()*sizeof(int32_t),cudaMemcpyDeviceToHost));
+        check(std::all_of(table.begin(),table.end(),[](int32_t x){return x==-1;}),
+              "aliased host copy still invalidates destination residency");
+    }
+}
+
 void full_session(int fmt, int mode, int experts) {
     Fixture main(fmt,mode), draft(fmt==3?kKvInt8:fmt,2);
     auto& g=main.g;
@@ -305,6 +339,7 @@ void full_session(int fmt, int mode, int experts) {
 int main() {
     int devices=0;
     if (cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
+    borrowed_kv_copy();
     for (int fmt : std::array<int,4>{kKvF16,kKvInt8,kKvQ4,3}) for (int mode : {0,1,2}) {
         if (fmt==3 && mode!=0) continue;
         Fixture f(fmt,mode);

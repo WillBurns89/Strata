@@ -235,12 +235,149 @@ bool run(int fmt) {
     }
     return bad == 0;
 }
+
+// The main session's graph must follow the device descriptor on EVERY replay. Deliberately leave the
+// captured CPU bundle pointing at A, then replay A/B/A/B/B/A with different contents and append positions.
+// This exercises the actual FP16 append and resolve kernels, and checks the inactive owner's whole pool.
+bool run_host_borrow() {
+    const k::QsaShapes s = k::qsa_real_shapes();
+    const int64_t blocks = 2048, slots_n = 1024, cap = 8;
+    const size_t values = (size_t) blocks * s.n_head_kv * s.page_size * s.head_dim;
+    const size_t slot_values = (size_t) slots_n * s.n_head_kv * s.page_size * s.head_dim;
+    const size_t page_values = (size_t) s.n_head_kv * s.page_size * s.head_dim;
+    std::vector<void*> device_allocations, host_allocations;
+    auto device = [&](size_t bytes) {
+        void* p = nullptr;
+        ck(cudaMalloc(&p, bytes), "borrow malloc");
+        device_allocations.push_back(p);
+        ck(cudaMemset(p, 0, bytes), "borrow memset");
+        return p;
+    };
+    auto mapped = [&](size_t bytes) {
+        void* h = nullptr;
+        void* d = nullptr;
+        ck(cudaHostAlloc(&h, bytes, cudaHostAllocMapped), "borrow hostalloc");
+        host_allocations.push_back(h);   // free the HOST allocation, never its device alias
+        ck(cudaHostGetDevicePointer(&d, h, 0), "borrow mapped pointer");
+        return static_cast<uint16_t*>(d);
+    };
+    k::KvHostPools owners[2];
+    std::vector<uint16_t> expected[2][2];
+    for (int owner = 0; owner < 2; ++owner) {
+        owners[owner].k_pool = mapped(values * sizeof(uint16_t));
+        owners[owner].v_pool = mapped(values * sizeof(uint16_t));
+        for (int role = 0; role < 2; ++role) {
+            auto& e = expected[owner][role];
+            e.resize(values);
+            for (size_t i = 0; i < values; ++i)
+                e[i] = (uint16_t) ((owner ? 0xb800 : 0x3400) + role * 0x100 + i % 127);
+            ck(cudaMemcpy(role ? owners[owner].v_pool : owners[owner].k_pool, e.data(),
+                          values * sizeof(uint16_t), cudaMemcpyDefault), "borrow poison owner");
+        }
+    }
+    k::KvHostPools* descriptor = static_cast<k::KvHostPools*>(device(sizeof(k::KvHostPools)));
+    k::KvHostPools view = owners[0];
+    view.descriptor = descriptor;
+    Pools slots, ref;
+    slots.p.k_pool = static_cast<uint16_t*>(device(slot_values * sizeof(uint16_t)));
+    slots.p.v_pool = static_cast<uint16_t*>(device(slot_values * sizeof(uint16_t)));
+    ref.p.k_pool = static_cast<uint16_t*>(device(values * sizeof(uint16_t)));
+    ref.p.v_pool = static_cast<uint16_t*>(device(values * sizeof(uint16_t)));
+    auto ints = [&](int64_t n) { return static_cast<int32_t*>(device((size_t) n * sizeof(int32_t))); };
+    k::KvStreamMap m;
+    m.n_blocks = blocks; m.n_slots = slots_n;
+    m.page_table = ints(blocks); m.slot_block = ints(slots_n); m.slot_stamp = ints(slots_n);
+    m.slot_ref = ints(slots_n); m.miss_block = ints(slots_n); m.miss_slot = ints(slots_n);
+    m.ctl = ints(k::kKvCtlInts);
+    int32_t* ident = ints(blocks);
+    int32_t* step = ints(k::kStepCount);
+    int32_t* ids = ints(cap);
+    std::vector<int32_t> table((size_t) blocks);
+    for (int64_t b = 0; b < blocks; ++b) table[(size_t) b] = (int32_t) b;
+    ck(cudaMemcpy(ident, table.data(), table.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "borrow identity");
+    float* kc = static_cast<float*>(device((size_t) s.n_head_kv * s.head_dim * sizeof(float)));
+    float* vc = static_cast<float*>(device((size_t) s.n_head_kv * s.head_dim * sizeof(float)));
+    cudaStream_t stream = nullptr;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "borrow stream");
+    ck(cudaDeviceSynchronize(), "borrow before capture");
+    ck(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "borrow capture begin");
+    k::kv_stream_reset(m, stream);
+    k::kv_append_step(slots.p.k_pool, slots.p.v_pool, m.page_table, step, kc, vc, s, stream, &view);
+    k::kv_stream_resolve(m, slots.attn(m.page_table), view, k::kKvF16, ids, step, 1, cap, s, stream);
+    ck(cudaStreamEndCapture(stream, &graph), "borrow capture end");
+    ck(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "borrow instantiate");
+
+    int bad = 0, turn = 0;
+    std::vector<float> hkc((size_t) s.n_head_kv * s.head_dim), hvc(hkc.size());
+    std::vector<uint16_t> actual(values), page(page_values);
+    for (const int owner : {0, 1, 0, 1, 1, 0}) {
+        const int block = 100 + 37 * turn;
+        const int pos = block * (int) s.page_size + (int) s.page_size - 1;
+        const int32_t st[k::kStepCount] = {pos, pos + 1, (pos + 1) / 4, (int32_t) cap};
+        int32_t selected[8];
+        for (int i = 0; i < 4; ++i) { selected[i] = i; selected[i + 4] = block * 4 + i; }
+        for (size_t i = 0; i < hkc.size(); ++i) {
+            hkc[i] = (float) (turn + 1) + (float) (i % 31) / 32.f;
+            hvc[i] = -hkc[i];
+        }
+        ck(cudaMemcpy(step, st, sizeof st, cudaMemcpyHostToDevice), "borrow step");
+        ck(cudaMemcpy(ids, selected, sizeof selected, cudaMemcpyHostToDevice), "borrow selection");
+        ck(cudaMemcpy(kc, hkc.data(), hkc.size() * sizeof(float), cudaMemcpyHostToDevice), "borrow K input");
+        ck(cudaMemcpy(vc, hvc.data(), hvc.size() * sizeof(float), cudaMemcpyHostToDevice), "borrow V input");
+        ck(cudaMemcpy(ref.p.k_pool, expected[owner][0].data(), values * sizeof(uint16_t), cudaMemcpyHostToDevice), "borrow reference K");
+        ck(cudaMemcpy(ref.p.v_pool, expected[owner][1].data(), values * sizeof(uint16_t), cudaMemcpyHostToDevice), "borrow reference V");
+        // Exact original append kernel is the arithmetic reference; no hand-written FP16 conversion oracle.
+        k::kv_append_step(ref.p.k_pool, ref.p.v_pool, ident, step, kc, vc, s, stream, nullptr);
+        ck(cudaStreamSynchronize(stream), "borrow reference append");
+        ck(cudaMemcpy(expected[owner][0].data(), ref.p.k_pool, values * sizeof(uint16_t), cudaMemcpyDeviceToHost), "borrow expected K");
+        ck(cudaMemcpy(expected[owner][1].data(), ref.p.v_pool, values * sizeof(uint16_t), cudaMemcpyDeviceToHost), "borrow expected V");
+        ck(cudaMemcpy(descriptor, &owners[owner], sizeof(k::KvHostPools), cudaMemcpyHostToDevice), "borrow switch descriptor");
+        ck(cudaGraphLaunch(exec, stream), "borrow graph replay");
+        ck(cudaStreamSynchronize(stream), "borrow graph complete");
+        for (int check_owner = 0; check_owner < 2; ++check_owner)
+            for (int role = 0; role < 2; ++role) {
+                ck(cudaMemcpy(actual.data(), role ? owners[check_owner].v_pool : owners[check_owner].k_pool,
+                              values * sizeof(uint16_t), cudaMemcpyDefault), "borrow check owner");
+                if (actual != expected[check_owner][role]) ++bad;
+            }
+        ck(cudaMemcpy(table.data(), m.page_table, table.size() * sizeof(int32_t), cudaMemcpyDeviceToHost), "borrow table");
+        for (const int b : {0, block}) {
+            const int sl = table[(size_t) b];
+            if (sl < 0 || sl >= slots_n) { ++bad; continue; }
+            for (int role = 0; role < 2; ++role) {
+                const uint16_t* source = (role ? slots.p.v_pool : slots.p.k_pool) + (size_t) sl * page_values;
+                ck(cudaMemcpy(page.data(), source, page_values * sizeof(uint16_t), cudaMemcpyDeviceToHost), "borrow resolved page");
+                if (!std::equal(page.begin(), page.end(), expected[owner][role].begin() + (size_t) b * page_values)) ++bad;
+            }
+        }
+        const auto counters = k::kv_stream_counters(m);
+        if (counters.overflow || counters.calls != 1 || counters.misses != 2) ++bad;
+        ++turn;
+    }
+    ck(cudaGraphExecDestroy(exec), "borrow destroy executable");
+    ck(cudaGraphDestroy(graph), "borrow destroy graph");
+    ck(cudaStreamDestroy(stream), "borrow destroy stream");
+    for (void* p : device_allocations) ck(cudaFree(p), "borrow free device");
+    for (void* p : host_allocations) ck(cudaFreeHost(p), "borrow free owner");
+    std::printf("  fp16 borrowed host graph: %d owner replays, %d byte/ownership failures\n", turn, bad);
+    return bad == 0;
+}
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool borrow_only = argc == 2 && std::strcmp(argv[1], "--host-borrow-only") == 0;
+    if (argc != 1 && !borrow_only) {
+        std::fprintf(stderr, "usage: kv_stream_parity [--host-borrow-only]\n");
+        return 2;
+    }
     std::printf("kv_stream_parity: streamed vs resident KV, bitwise\n");
-    const bool a = run(k::kKvInt8), b = run(k::kKvF16), c = run(k::kKvQ4), d = run(k::kKvHybrid);
-    if (!a || !b || !c || !d) ++g_fail;
+    if (!run_host_borrow()) ++g_fail;
+    if (!borrow_only) {
+        const bool a = run(k::kKvInt8), b = run(k::kKvF16), c = run(k::kKvQ4), d = run(k::kKvHybrid);
+        if (!a || !b || !c || !d) ++g_fail;
+    }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }

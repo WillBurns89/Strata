@@ -28,6 +28,7 @@ struct Runs {
     uint8_t* dst[4];
     int len[4];
     int n;
+    const KvHostPools* descriptor = nullptr;   // FP16 borrowed main only; fixed graph argument
 };
 
 Runs runs_of(const QsaAttnPools& slots, const KvHostPools& host, int fmt, const QsaShapes& s) {
@@ -57,6 +58,7 @@ Runs runs_of(const QsaAttnPools& slots, const KvHostPools& host, int fmt, const 
         r.src[0] = (const uint8_t*) host.k_pool; r.dst[0] = (uint8_t*) slots.k_pool; r.len[0] = bytes;
         r.src[1] = (const uint8_t*) host.v_pool; r.dst[1] = (uint8_t*) slots.v_pool; r.len[1] = bytes;
         r.n = 2;
+        r.descriptor = host.descriptor;
     }
     return r;
 }
@@ -165,7 +167,13 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
 }
 
 // One block per missed block (grid-stride): copy its runs from the host copy into its slot, 16 B per thread.
+template<bool Borrowed = false>
 __global__ void copy_kernel(KvStreamMap m, Runs r) {
+    if constexpr (Borrowed) {
+        const KvHostPools h = *r.descriptor;
+        r.src[0] = reinterpret_cast<const uint8_t*>(h.k_pool);
+        r.src[1] = reinterpret_cast<const uint8_t*>(h.v_pool);
+    }
     const int need = m.ctl[2];
     for (int k = blockIdx.x; k < need; k += gridDim.x) {
         const long long b = m.miss_block[k], sl = m.miss_slot[k];
@@ -229,7 +237,11 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
     }
     resolve_kernel<<<1, RT, 0, (cudaStream_t) stream>>>(m, ids, steps, (int) n_q, (int) cap, (int) s.page_size);
     check("resolve");
-    copy_kernel<<<96, 128, 0, (cudaStream_t) stream>>>(m, runs_of(slots, host, fmt, s));
+    const Runs runs = runs_of(slots, host, fmt, s);
+    if (runs.descriptor != nullptr)
+        copy_kernel<true><<<96, 128, 0, (cudaStream_t) stream>>>(m, runs);
+    else
+        copy_kernel<false><<<96, 128, 0, (cudaStream_t) stream>>>(m, runs);
     check("copy");
 }
 

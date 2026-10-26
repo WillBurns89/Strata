@@ -38,6 +38,10 @@ struct KvHostPools {
     uint16_t* v_scale = nullptr;
     uint8_t* k_q4 = nullptr;      ///< q4_0 mode (kv_q4.hpp): block_q4_0 codes, 144 B per cell and head
     uint8_t* v_q4 = nullptr;
+    /// Opt-in FP16 main-session view: a stable DEVICE address whose value names the currently leased host pools.
+    /// Captured append/resolve kernels dereference it at execution. Noncaptured DMA uses the direct fields above.
+    /// The descriptor's contents have descriptor == nullptr; ordinary owning states leave this field null.
+    const KvHostPools* descriptor = nullptr;
     bool present() const { return k_pool != nullptr || k_q != nullptr || k_q4 != nullptr; }
 };
 

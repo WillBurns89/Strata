@@ -241,6 +241,7 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
     for (size_t i = 0; i < sizes.size(); ++i) {
         if (!sizes[i]) continue;
         if (!src[i] || !dst[i]) { error = "conversation snapshot: missing state buffer"; return false; }
+        if (i < 4 && src[i] == dst[i]) continue;   // leased host K/V already has these bytes; indexer still copies
         const cudaError_t e = conversation_detail::copy_nonblocking(dst[i], src[i], sizes[i], queued);
         if (e != cudaSuccess) { error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); return false; }
     }

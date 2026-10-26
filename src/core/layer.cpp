@@ -772,6 +772,11 @@ int64_t qsa_kv_resident_min() { return 20480; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
+    return qsa_state_bytes(g, max_cells, with_rope, ring_cells, HostKvAllocation::Owned);
+}
+
+uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells,
+                         HostKvAllocation host_allocation) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     uint64_t n = 0;
@@ -787,13 +792,25 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
     if (with_rope) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;          // cos + sin tables
     n += strata::kernels::qsa_step_bytes() + 16;                               // counts and aligned attention status
     n += (uint64_t) s.n_head * 4;                                              // pos_dev
+    if (host_allocation == HostKvAllocation::Borrowed)
+        n += sizeof(strata::kernels::KvHostPools) + 16;                         // stable device descriptor
     return align_up16(n) + 256;
 }
 
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
                         const QsaState* share_rope, int64_t ring_cells) {
+    return qsa_state_init(g, max_cells, base, st, share_rope, ring_cells, HostKvAllocation::Owned);
+}
+
+uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
+                        const QsaState* share_rope, int64_t ring_cells, HostKvAllocation host_allocation) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
+    if (host_allocation == HostKvAllocation::Borrowed &&
+        (p.mode != 1 || g_kv_int8 || g_kv_q4 || g_kv_hybrid || ring_cells != 0)) {
+        std::fprintf(stderr, "strata: borrowed host KV requires an FP16 streamed main state\n");
+        return 0;
+    }
     const int64_t pages = p.pages;
     Cursor c{(uint8_t*) base};
     st.kv_int8 = g_kv_int8 && !g_kv_q4;
@@ -892,6 +909,9 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.step = c.take<int32_t>((uint64_t) strata::kernels::kStepCount);
     st.attention_status = c.take<int32_t>(1);
     st.pos_dev = c.take<int32_t>((uint64_t) s.n_head);
+    st.host_allocation = host_allocation;
+    st.host_descriptor = host_allocation == HostKvAllocation::Borrowed
+                             ? c.take<strata::kernels::KvHostPools>(1) : nullptr;
     // the pinned staging the uploads copy FROM - see the note on `host_step` in the header
     if (strata::core::host_alloc_guarded((void**) &st.host_step, strata::kernels::qsa_step_bytes() + sizeof(int32_t),
                       cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
@@ -902,7 +922,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.host_step[strata::kernels::kStepCount] = 0;
     // KV streaming: the authoritative K/V of every cell, pinned and device-mapped, in the identity layout
     st.host = strata::kernels::KvHostPools{};
-    if (p.mode != 0) {
+    if (p.mode != 0 && host_allocation == HostKvAllocation::Owned) {
         const uint64_t hrows = (uint64_t) pages * s.n_head_kv * s.page_size;
         const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
         uint8_t* h = nullptr;
@@ -934,6 +954,11 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             st.host.k_pool = hc.take<uint16_t>(hrows * s.head_dim);
             st.host.v_pool = hc.take<uint16_t>(hrows * s.head_dim);
         }
+    }
+    if (st.host_descriptor != nullptr) {
+        // No authoritative host allocation for this view. The driver binds an owning slot before capture or use.
+        if (cudaMemset(st.host_descriptor, 0, sizeof(strata::kernels::KvHostPools)) != cudaSuccess) return 0;
+        st.host.descriptor = st.host_descriptor;
     }
     // THE ROPE TABLE IS BUILT ON THE HOST IN FLOAT64 and uploaded once, because the reference computes its
     // frequencies in float64 and reproducing that on device means double-precision `pow`/`cos` that need not

@@ -119,6 +119,7 @@ __device__ __forceinline__ float h2f(uint16_t bits) { return f32_from_f16(bits);
 
 // ================= 1. kv_append =================
 
+template<bool Borrowed = false>
 __global__ void kv_append_kernel(uint16_t* __restrict__ k_pool, uint16_t* __restrict__ v_pool,
                                  const int32_t* __restrict__ table, const int32_t* __restrict__ step,
                                  const float* __restrict__ kcur, const float* __restrict__ vcur, int kv_heads,
@@ -126,6 +127,7 @@ __global__ void kv_append_kernel(uint16_t* __restrict__ k_pool, uint16_t* __rest
     const long long pos = (long long) __ldg(step + kStepPos);
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= kv_heads * head_dim) return;
+    if constexpr (Borrowed) host = *host.descriptor;
     const int h = i / head_dim, d = i - h * head_dim;
     // `[page][kv_head][page_size][head_dim]`: one head's consecutive cells are contiguous inside a page.
     // KV streaming: the host copy (identity layout) always, the VRAM page only if the block is resident.
@@ -598,9 +600,13 @@ void kv_append_step(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_tabl
     if (step == nullptr) fail("kv_append: step is null");
     // The grid is the head x dim count, which is a CONSTANT - `kv_append` writes one cell.
     const long long n = s.n_head_kv * s.head_dim;
-    kv_append_kernel<<<grid_for(n, THREADS), THREADS, 0, (cudaStream_t) stream>>>(
-        k_pool, v_pool, page_table, step, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size,
-        host ? *host : KvHostPools{});
+    const KvHostPools h = host ? *host : KvHostPools{};
+    if (h.descriptor != nullptr)
+        kv_append_kernel<true><<<grid_for(n, THREADS), THREADS, 0, (cudaStream_t) stream>>>(
+            k_pool, v_pool, page_table, step, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size, h);
+    else
+        kv_append_kernel<false><<<grid_for(n, THREADS), THREADS, 0, (cudaStream_t) stream>>>(
+            k_pool, v_pool, page_table, step, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size, h);
     check_launch("kv_append");
     if (stream == nullptr) check_sync("kv_append");
 }

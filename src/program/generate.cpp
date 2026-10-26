@@ -2766,6 +2766,34 @@ int main(int argc, char** argv) {
         }
         }
     }
+    const char* host_kv_borrow_env = std::getenv("STRATA_SLOT_HOST_KV_BORROW");
+    const bool slot_host_kv_borrow = host_kv_borrow_env != nullptr && std::strcmp(host_kv_borrow_env, "1") == 0;
+    if (host_kv_borrow_env != nullptr && host_kv_borrow_env[0] != '\0' &&
+        std::strcmp(host_kv_borrow_env, "0") != 0 && !slot_host_kv_borrow) {
+        std::fprintf(stderr, "strata: STRATA_SLOT_HOST_KV_BORROW must be 0 or 1\n");
+        return 2;
+    }
+    if (slot_host_kv_borrow) {
+#if !defined(_WIN32) || defined(STRATA_USE_HIP) || defined(STRATA_GPU_METAL) || defined(STRATA_USE_SYCL)
+        std::fprintf(stderr, "strata: host KV borrow is currently supported only by the Windows CUDA engine\n");
+        return 2;
+#else
+        const char* bm = std::getenv("STRATA_BATCH_MTP");
+        const char* kg = std::getenv("STRATA_KV_GROW");
+        const char* pd = std::getenv("STRATA_PRIMARY_DEVICE");
+        bool remote = false;
+        for (const int n : o.expert_cache_remote) remote = remote || n > 0;
+        if (!o.serve || o.batch != 2 || o.max_context != 262144 || o.kv != "fp16" ||
+            o.kv_resident <= 0 || o.kv_resident >= o.max_context || !o.layer_split.empty() ||
+            o.peer_device >= 0 || o.pipeline_windows > 0 || o.batch_groups > 1 || o.batch_mtp ||
+            (bm && bm[0] && bm[0] != '0') || o.kv_grow || (kg && kg[0] && kg[0] != '0') ||
+            (pd && std::atoi(pd) != 0) || remote || o.remote_expert_opt || o.vram_elastic || o.no_capture) {
+            std::fprintf(stderr, "strata: host KV borrow requires --serve --batch 2, 262144 context, streamed FP16 KV, "
+                                 "one primary CUDA GPU, graphs, no split/peer/remote/elastic/pipeline or batch MTP\n");
+            return 2;
+        }
+#endif
+    }
 #if defined(STRATA_USE_HIP)
     {   // gfx1151 (Strix Halo): the switches that are exact there are on by default (strata/core/arch_defaults.hpp); before
         // any engine code reads its switches (they are read at first use), and the user's own settings are kept
@@ -5137,6 +5165,14 @@ int main(int argc, char** argv) {
                                  "follows)\n", st.dev, (double) fb / 1073741824.0);
         }
 
+    const auto main_host_allocation = slot_host_kv_borrow ? strata::core::HostKvAllocation::Borrowed
+                                                         : strata::core::HostKvAllocation::Owned;
+    if (slot_host_kv_borrow && (multi_gpu || !stages.empty() || primary_device != 0 ||
+                               o.pipeline_windows != 0 || g.n_qsa_layers() != 12 ||
+                               g.n_head_kv != 2 || g.head_dim != 256)) {
+        std::fprintf(stderr, "strata: host KV borrow: unsupported resolved topology or model geometry\n");
+        return 1;
+    }
     // ---- CUDA0's session, and the stages' sessions: sized to each device's own layer range (the carve).  A
     // stage that runs [lb, le) carves only those layers' GDN rows and QSA pools - before the carve every stage
     // held all 48 layers' state whatever layers it ran, which is the same disease the chunked-QSA-prefill PR
@@ -5163,11 +5199,11 @@ int main(int argc, char** argv) {
             strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
             strata::core::ExpertCache::set_vmm(on);
         }
-        if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
+        if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0, main_host_allocation)) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
             return 1;
         }
-        if (strata::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0) == 0) {
+        if (strata::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0, main_host_allocation) == 0) {
             std::fprintf(stderr, "strata generate: session_init failed\n");
             return 1;
         }
@@ -5249,6 +5285,10 @@ int main(int argc, char** argv) {
     };
     const char* batch_mtp_env = std::getenv("STRATA_BATCH_MTP");
     bool batch_mtp = o.batch_mtp || (batch_mtp_env != nullptr && batch_mtp_env[0] != '\0' && batch_mtp_env[0] != '0');
+    if (slot_host_kv_borrow && batch_mtp) {
+        std::fprintf(stderr, "strata: host KV borrow does not support batch MTP\n");
+        return 1;
+    }
     if (batch_mtp) {
         // (--pipeline-windows is already off with --batch slots)
         const char* why = o.batch < 2 ? "it needs --batch 2 or more" : o.mtp.empty() ? "it needs --mtp"
@@ -5368,6 +5408,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: --batch: %d slot sessions on CUDA%d (%.2f GiB each); %.2f GiB free\n",
                          (int) bslot_ss[k].size(), dev, (double) bytes / 1073741824.0, (double) fb / 1073741824.0);
         }
+        if (slot_host_kv_borrow && (fit != 2 || bslot_ss.size() != 1 || bslot_ss[0].size() != 2)) {
+            std::fprintf(stderr, "strata: host KV borrow needs both owning slots; reduced-slot fallback is forbidden\n");
+            return 1;
+        }
         for (auto& v : bslot_ss) if ((int) v.size() > fit) v.resize((size_t) fit);   // the same count on every stage
         if (fit < 2) {
             std::fprintf(stderr, "strata generate: WARNING: --batch is off: not two slot sessions fit (a smaller "
@@ -5390,6 +5434,43 @@ int main(int argc, char** argv) {
                                  "expert cache would otherwise hold\n", o.batch,
                          (double) bytes0 * o.batch / 1073741824.0);
         }
+    }
+
+    // The main view has no authoritative host allocation in this mode. Epochs live outside BSlot because
+    // admission and BYIELD replace BSlot metadata wholesale. Appending a batch reply does not change its epoch:
+    // the prefix below main_host_valid remains immutable while that owner decodes.
+    std::array<uint64_t, 2> host_kv_epochs{};
+    int main_host_owner = -1;
+    uint64_t main_host_epoch = 0;
+    int64_t main_host_valid = 0;
+    auto bind_main_host = [&](int b, std::string& e) -> bool {
+        if (!slot_host_kv_borrow) return true;
+        if (b < 0 || b >= 2 || bslot_ss.size() != 1 || bslot_ss[0].size() != 2) {
+            e = "host KV borrow: invalid destination owner";
+            return false;
+        }
+        if (cudaDeviceSynchronize() != cudaSuccess ||
+            !strata::core::session_bind_host_kv(ss, *bslot_ss[0][(size_t) b], e)) {
+            if (e.empty()) e = "host KV borrow: device drain failed";
+            return false;
+        }
+        main_host_owner = b;
+        main_host_epoch = host_kv_epochs[(size_t) b];
+        return true;
+    };
+    if (slot_host_kv_borrow) {
+        if (o.batch != 2 || o.batch_groups != 1 || !bind_main_host(0, err)) {
+            std::fprintf(stderr, "strata: host KV borrow initialization failed: %s\n", err.c_str());
+            return 1;
+        }
+        const auto qs = strata::core::qsa_shapes(g);
+        uint64_t omitted = 0;
+        for (int64_t j = 0; j < ss.qsa_alloc; ++j)
+            omitted += (uint64_t) ss.qsa_states[ss.qsa_ord0 + j].n_pages *
+                           strata::kernels::kv_block_bytes(qs, strata::kernels::kKvF16) + 1024;
+        std::fprintf(stderr, "strata generate: actual=host-kv-borrow, main host allocation omitted=%llu bytes; "
+                             "two owning slots, all GPU state retained, pinned KV total=%.3f GiB\n",
+                     (unsigned long long) omitted, (double) strata::core::qsa_kv_host_bytes() / 1073741824.0);
     }
 
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts.
@@ -11221,6 +11302,57 @@ int main(int argc, char** argv) {
         };
         int admit_slot = -1;               ///< the slot the request being read will continue in (BGEN)
         long long admit_max_new = 0;
+        auto main_host_current = [&]() {
+            return !slot_host_kv_borrow ||
+                   (main_host_owner >= 0 && main_host_owner < 2 &&
+                    main_host_epoch == host_kv_epochs[(size_t) main_host_owner]);
+        };
+        auto invalidate_main_host_view = [&]() {
+            live_ok = false;
+            live.clear();
+            live_imgs.clear();
+            checks.clear();
+            tail_ckpt_len = -1;
+            conversations.take_reuse();
+            main_host_valid = 0;
+        };
+        // No replacement host image: preserve only the required prefix by copying directly into the destination's
+        // existing pages before switching the main view. Parking before this call obeys the ordinary cache budget.
+        auto begin_host_write = [&](int b, int64_t keep, std::string& e) -> bool {
+            if (!slot_host_kv_borrow) return true;
+            if (b < 0 || b >= (int) bs.size() || bs[(size_t) b].active || !main_host_current() ||
+                keep < 0 || keep > main_host_valid || host_kv_epochs[(size_t) b] == UINT64_MAX) {
+                e = "host KV borrow: invalid writer lease or unavailable prefix";
+                return false;
+            }
+            if (bs[(size_t) main_host_owner].active && main_host_valid > bs[(size_t) main_host_owner].p) {
+                e = "host KV borrow: main prefix overlaps its owner's uncommitted suffix";
+                return false;
+            }
+            if (!ver.wait_commit(e) || (use_mtp && !mtp.idle(e)) || cudaDeviceSynchronize() != cudaSuccess) {
+                if (e.empty()) e = "host KV borrow: writer drain failed";
+                return false;
+            }
+            // Invalidate BEFORE the first potentially destructive copy. Keep source metadata alive until the
+            // selected checkpoint/partial prompt below has been restored; tainted prevents later stale reuse.
+            bs[(size_t) b].cached = false;
+            bs[(size_t) b].tainted = true;
+            ++host_kv_epochs[(size_t) b];
+            const int old_owner = main_host_owner;
+            if (keep > 0 && old_owner != b) {
+                auto& dst = *bslot_ss[0][(size_t) b];
+                for (int64_t j = 0; j < ss.qsa_alloc; ++j)
+                    if (!strata::core::conversation_kv_copy(ss.qsa_states[ss.qsa_ord0 + j],
+                            dst.qsa_states[dst.qsa_ord0 + j], g, keep, false, e)) return false;
+            }
+            if (!bind_main_host(b, e)) return false;
+            main_host_valid = keep;
+            if (trace)
+                std::fprintf(stderr, "strata host KV borrow: owner %d -> %d, epoch %llu, retained %lld cells%s\n",
+                             old_owner, b, (unsigned long long) main_host_epoch, (long long) keep,
+                             keep > 0 && old_owner != b ? " (direct prefix copy)" : "");
+            return true;
+        };
         auto batch_on = [&] { for (const BSlot& b : bs) if (b.active) return true; return false; };
         auto try_next_line = [&](std::string& out) -> bool {
             std::lock_guard<std::mutex> lk(in_mu);
@@ -11271,7 +11403,19 @@ int main(int argc, char** argv) {
         };
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
-            if (slot_copy_direct) {
+            if (slot_host_kv_borrow) {
+                if (b < 0 || b >= (int) bs.size() || bs[(size_t) b].active || !main_host_current()) {
+                    e = "host KV borrow: admission cannot overwrite an active or stale owner";
+                    return false;
+                }
+                if (b != main_host_owner) {
+                    if (host_kv_epochs[(size_t) b] == UINT64_MAX) { e = "host KV borrow: epoch exhausted"; return false; }
+                    bs[(size_t) b].cached = false;
+                    bs[(size_t) b].tainted = true;
+                    ++host_kv_epochs[(size_t) b];
+                }
+            }
+            if (slot_copy_direct || slot_host_kv_borrow) {
                 if (!direct_slot_copy(true, b, ids, e)) return false;
             } else
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
@@ -11316,7 +11460,7 @@ int main(int argc, char** argv) {
         auto copy_from_slot = [&](int b, const ConvCheckpoint* at, std::string& e) -> bool {
             const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
             if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
-            if (slot_copy_direct && at == nullptr) {
+            if ((slot_copy_direct || slot_host_kv_borrow) && at == nullptr) {
                 if (!direct_slot_copy(false, b, bs[(size_t) b].ids, e)) return false;
             } else
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
@@ -11335,6 +11479,11 @@ int main(int argc, char** argv) {
                         return false;
                 }
                 for (int64_t j = 0; j < from.qsa_alloc; ++j) {
+                    if (slot_host_kv_borrow) {
+                        if (!strata::core::conversation_kv_copy(from.qsa_states[from.qsa_ord0 + j],
+                                to.qsa_states[to.qsa_ord0 + j], g, upto, true, e)) return false;
+                        continue;
+                    }
                     strata::core::ConversationKv img;
                     if (!strata::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
                         return false;
@@ -12370,6 +12519,26 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            int host_write_slot = -1;
+            if (slot_host_kv_borrow) {
+                if (!main_host_current() || (live_ok && (int64_t) live.size() > main_host_valid)) {
+                    invalidate_main_host_view();
+                    std::printf("ERR host KV borrow: live metadata outlived its owner or valid prefix\n");
+                    return 1;
+                }
+                // GEN/GENI may use the main decoder without BGEN. It still needs one of the TWO owners; an
+                // active peer is never overwritten and this mode never creates a third private K/V allocation.
+                host_write_slot = admit_slot;
+                if (host_write_slot < 0 && main_host_owner >= 0 && !bs[(size_t) main_host_owner].active)
+                    host_write_slot = main_host_owner;
+                for (int b = 0; host_write_slot < 0 && b < (int) bs.size(); ++b)
+                    if (!bs[(size_t) b].active) host_write_slot = b;
+                if (host_write_slot < 0 || bs[(size_t) host_write_slot].active) {
+                    std::printf("ERR host KV borrow: both slot owners are active\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+            }
             if (o.prefill_head_alias && native_head.loaded()) {
                 const auto head_t0 = Clock::now();
                 native_head.unload();
@@ -12617,6 +12786,13 @@ int main(int argc, char** argv) {
                        !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
+            }
+            if (slot_host_kv_borrow) {
+                const int64_t keep = !incoming && !borrow && slot_source < 0 ? resume : 0;
+                if (!begin_host_write(host_write_slot, keep, err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;   // no publication after a partial copy or descriptor update
+                }
             }
             if (slot_source >= 0) {
                 lent_slot = -1;   // (a longer start than the main session's)
@@ -12883,6 +13059,7 @@ int main(int argc, char** argv) {
             req_times = ReqTimes{};
             if (use_mtp) mtp.set_prompt_len(n);
             const int64_t read_from = reread_to > 0 ? 0 : resume;
+            if (slot_host_kv_borrow) main_host_valid = read_from;
             conversations.limit_reuse(read_from);
             pp_total = n;
             pp_from = read_from;
@@ -13342,7 +13519,7 @@ int main(int argc, char** argv) {
                 // where the rest is read the same way after it (more than a chunk and more than a short read left),
                 // text only, and into a slot that is not decoding.
                 auto give_way = [&](int ys, int64_t q, std::string& err) -> bool {
-                    const bool can = ys < (int) bs.size() && !bs[(size_t) ys].active &&
+                    const bool can = ys >= 0 && ys < (int) bs.size() && !bs[(size_t) ys].active &&
                                      (admit_slot < 0 || ys == admit_slot) && req_imgs.empty() && o.prompt_cache > 0 &&
                                      b0 - q > std::max<int64_t>(C_read, o.short_read);
                     std::string ye;
@@ -15087,6 +15264,12 @@ int main(int argc, char** argv) {
                              (long long) pp_reached);
             }
             static const bool state_hash = std::getenv("STRATA_STATE_HASH") != nullptr;
+            if (slot_host_kv_borrow) {
+                if (!main_host_current()) { std::printf("ERR host KV borrow: writer epoch changed during request\n"); return 1; }
+                main_host_valid = std::max<int64_t>(read_from, std::max<int64_t>(pp_reached, yielded_at));
+                if (live_ok) main_host_valid = std::max<int64_t>(main_host_valid, (int64_t) live.size());
+                if (main_host_valid > ss.max_cells) { std::printf("ERR host KV borrow: invalid committed extent\n"); return 1; }
+            }
             if (state_hash && !cancelled && o.prompt_cache > 0) {   // every finished request, ckpt=0 too (parity gates)
                 // DEBUG: a fingerprint of every part of the session over the positions it holds ([0, L)), and
                 // separately of what lies past them in the last KV page (stale cells, fine unless something reads them)

@@ -54,6 +54,11 @@ static uint64_t ple_hist_bytes() {
 }
 
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo, int64_t layer_hi) {
+    return session_bytes(g, max_cells, k, layer_lo, layer_hi, HostKvAllocation::Owned);
+}
+
+uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo, int64_t layer_hi,
+                       HostKvAllocation host_allocation) {
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
     // QSA layers are `l % interval == interval-1`, so exactly `bound / interval` of them live below `bound`
@@ -66,7 +71,8 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
     n += (uint64_t) gdn_n * gdn_state_floats(g) * 4;
     // One QSA state carries the RoPE table; the others borrow it (P7: 64 MiB per layer at 262K).
     if (g.n_qsa_layers() > 0)
-        n += qsa_state_bytes(g, max_cells, true) + (uint64_t) (q_n - 1) * qsa_state_bytes(g, max_cells, false);
+        n += qsa_state_bytes(g, max_cells, true, 0, host_allocation) +
+             (uint64_t) (q_n - 1) * qsa_state_bytes(g, max_cells, false, 0, host_allocation);
     n += qsa_buffers_bytes(g, max_cells);
     n += moe_buffers_bytes(g, k);
     n += block_buffers_bytes(g);
@@ -76,6 +82,11 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
 
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
                       int64_t layer_lo, int64_t layer_hi) {
+    return session_init(g, max_cells, k, base, s, layer_lo, layer_hi, HostKvAllocation::Owned);
+}
+
+uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
+                      int64_t layer_lo, int64_t layer_hi, HostKvAllocation host_allocation) {
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
     uint8_t* p = (uint8_t*) base;
@@ -105,7 +116,8 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // same way, which is a coupling with nothing to gain.  Only the range's ordinals are initialized; the
     // rest stay value-initialized nulls.  The FIRST ALLOCATED one (the session's primary, ordinal qsa_ord0)
     // owns the RoPE table that the others - and the prefill staging identity, and the MTP drafter - borrow.
-    const uint64_t first = qsa_state_bytes(g, max_cells, true), rest = qsa_state_bytes(g, max_cells, false);
+    const uint64_t first = qsa_state_bytes(g, max_cells, true, 0, host_allocation);
+    const uint64_t rest = qsa_state_bytes(g, max_cells, false, 0, host_allocation);
     s.qsa_state_arena = take(g.n_qsa_layers() > 0 ? first + (uint64_t) (s.qsa_alloc - 1) * rest : 0);
     s.qsa_states = new QsaState[(size_t) g.n_qsa_layers()]();
     s.qsa_buf_arena = take(qsa_buffers_bytes(g, max_cells));
@@ -115,7 +127,8 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // attention read null host pointers at the first request ("illegal memory access"), so the session fails here
     for (int64_t j = 0; j < s.qsa_alloc; ++j)
         if (qsa_state_init(g, max_cells, qp + (j == 0 ? 0 : first + (uint64_t) (j - 1) * rest),
-                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0]) == 0)
+                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0],
+                           0, host_allocation) == 0)
             return 0;
     qsa_buffers_init(g, max_cells, s.qsa_buf_arena, s.qsa_bufs);
 
@@ -128,6 +141,45 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     s.ple_hist = (float*) take(ple_hist_bytes());
     s.R = s.block.R;
     return used;
+}
+
+bool session_bind_host_kv(SessionState& view, const SessionState& owner, std::string& error) {
+    if (view.max_cells != owner.max_cells || view.qsa_alloc <= 0 || view.qsa_alloc != owner.qsa_alloc ||
+        view.qsa_ord0 != owner.qsa_ord0 || !view.qsa_states || !owner.qsa_states) {
+        error = "host KV borrow: incompatible session views";
+        return false;
+    }
+    // Validate every layer before publishing any pointer. Main GPU buffers and graph addresses stay fixed.
+    for (int64_t j = 0; j < view.qsa_alloc; ++j) {
+        const auto& dst = view.qsa_states[view.qsa_ord0 + j];
+        const auto& src = owner.qsa_states[owner.qsa_ord0 + j];
+        if (dst.host_allocation != HostKvAllocation::Borrowed || !dst.host_descriptor ||
+            src.host_allocation != HostKvAllocation::Owned || src.host.descriptor ||
+            dst.kv_mode != 1 || src.kv_mode != 1 || qsa_kv_format(dst) != strata::kernels::kKvF16 ||
+            qsa_kv_format(src) != strata::kernels::kKvF16 || dst.max_cells != src.max_cells ||
+            dst.n_pages != src.n_pages || !src.host.k_pool || !src.host.v_pool) {
+            error = "host KV borrow: requires compatible owning FP16 streamed pools";
+            return false;
+        }
+    }
+    for (int64_t j = 0; j < view.qsa_alloc; ++j) {
+        auto& dst = view.qsa_states[view.qsa_ord0 + j];
+        const auto next = owner.qsa_states[owner.qsa_ord0 + j].host;
+        const cudaError_t e = cudaMemcpy(dst.host_descriptor, &next, sizeof next, cudaMemcpyHostToDevice);
+        if (e != cudaSuccess) {
+            error = std::string("host KV borrow: descriptor upload failed: ") + cudaGetErrorString(e);
+            return false;
+        }
+        dst.host = next;
+        dst.host.descriptor = dst.host_descriptor;
+        strata::kernels::kv_stream_reset(dst.map, nullptr);
+    }
+    const cudaError_t e = cudaDeviceSynchronize();
+    if (e != cudaSuccess) {
+        error = std::string("host KV borrow: residency reset failed: ") + cudaGetErrorString(e);
+        return false;
+    }
+    return true;
 }
 
 void session_release(SessionState& s) {
