@@ -2833,18 +2833,17 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata: host KV borrow is currently supported only by the Windows CUDA engine\n");
         return 2;
 #else
-        const char* bm = std::getenv("STRATA_BATCH_MTP");
         const char* kg = std::getenv("STRATA_KV_GROW");
         const char* pd = std::getenv("STRATA_PRIMARY_DEVICE");
         bool remote = false;
         for (const int n : o.expert_cache_remote) remote = remote || n > 0;
         if (!o.serve || o.batch != 2 || o.max_context != 262144 || o.kv != "fp16" ||
             o.kv_resident <= 0 || o.kv_resident >= o.max_context || !o.layer_split.empty() ||
-            o.peer_device >= 0 || o.pipeline_windows > 0 || o.batch_groups > 1 || o.batch_mtp ||
-            (bm && bm[0] && bm[0] != '0') || o.kv_grow || (kg && kg[0] && kg[0] != '0') ||
+            o.peer_device >= 0 || o.pipeline_windows > 0 || o.batch_groups > 1 ||
+            o.kv_grow || (kg && kg[0] && kg[0] != '0') ||
             (pd && std::atoi(pd) != 0) || remote || o.remote_expert_opt || o.vram_elastic || o.no_capture) {
             std::fprintf(stderr, "strata: host KV borrow requires --serve --batch 2, 262144 context, streamed FP16 KV, "
-                                 "one primary CUDA GPU, graphs, no split/peer/remote/elastic/pipeline or batch MTP\n");
+                                 "one primary CUDA GPU, graphs, no split/peer/remote/elastic/pipeline\n");
             return 2;
         }
 #endif
@@ -5340,10 +5339,9 @@ int main(int argc, char** argv) {
     };
     const char* batch_mtp_env = std::getenv("STRATA_BATCH_MTP");
     bool batch_mtp = o.batch_mtp || (batch_mtp_env != nullptr && batch_mtp_env[0] != '\0' && batch_mtp_env[0] != '0');
-    if (slot_host_kv_borrow && batch_mtp) {
-        std::fprintf(stderr, "strata: host KV borrow does not support batch MTP\n");
-        return 1;
-    }
+    // The combined opt-in keeps three separate draft pools; only the main TARGET pool is borrowed.
+    // Unlike the legacy batch-MTP path, it never silently disables drafting or changes its allocation mode.
+    const bool borrow_batch_mtp = slot_host_kv_borrow && batch_mtp;
     if (batch_mtp) {
         // (--pipeline-windows is already off with --batch slots)
         const char* why = o.batch < 2 ? "it needs --batch 2 or more" : o.mtp.empty() ? "it needs --mtp"
@@ -5362,6 +5360,10 @@ int main(int argc, char** argv) {
         if (why == nullptr && !stages.empty() && (remote_caches || o.remote_expert_opt))
             why = "it is not run with helper expert caches on a layer split";
         if (why != nullptr) {
+            if (borrow_batch_mtp) {
+                std::fprintf(stderr, "strata: borrowed-target batch MTP cannot start: %s\n", why);
+                return 1;
+            }
             std::fprintf(stderr, "strata generate: WARNING: --batch-mtp is off: %s\n", why);
             batch_mtp = false;
         }
@@ -5552,7 +5554,8 @@ int main(int argc, char** argv) {
         // the next window's drafts), and the round/step graphs carry the forcing kernel
         const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
         if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
-        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st && !mtp_first ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
+        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st && !mtp_first ? last_st->ss : ss,
+                                      mtp_t, err, o.mtp_window, nullptr, borrow_batch_mtp)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
         if (batch_mtp) {
             // Slot b's drafter lives where the solo drafter does (the guard above: the last stage's GPU), carved from the
@@ -5561,7 +5564,8 @@ int main(int argc, char** argv) {
             // runs on the first stage, as for the solo drafter (`mtp.set_ple_session(&ss)` above).
             for (int b = 0; b < o.batch; ++b) {
                 auto d = std::make_unique<strata::core::MtpDrafter>();
-                if (!d->load(o.mtp, draft_geometry, *bslot_ss.back()[(size_t) b], o.spec, err, o.mtp_window, &mtp)) {
+                if (!d->load(o.mtp, draft_geometry, *bslot_ss.back()[(size_t) b], o.spec, err, o.mtp_window,
+                             &mtp, borrow_batch_mtp)) {
                     std::fprintf(stderr, "strata generate: batch MTP slot %d: %s%s\n", b, err.c_str(),
                                  vram_free_note().c_str());
                     return 1;
@@ -5580,6 +5584,103 @@ int main(int argc, char** argv) {
             }
         }
     }
+    // Check the compound mode against the allocations that actually succeeded, not requested flags. These
+    // drafters share immutable weights, never authoritative K/V or device rings. The main target is the only view.
+    auto check_borrow_batch_mtp = [&](const char* phase, std::string& e) -> bool {
+        if (!borrow_batch_mtp) return true;
+        if (!batch_mtp || o.mtp.empty() || o.batch != 2 || o.batch_groups != 1 ||
+            bslot_ss.size() != 1 || bslot_ss[0].size() != 2 || slot_mtp.size() != 2 ||
+            ss.qsa_alloc <= 0 || main_host_owner < 0 || main_host_owner >= 2) {
+            e = "borrowed-target batch MTP: actual slot/drafter ownership is incomplete";
+            return false;
+        }
+        struct Range { uintptr_t first, last; };
+        std::vector<Range> host_ranges, device_ranges;
+        uint64_t target_bytes = 0, draft_bytes = 0;
+        auto add_range = [&](std::vector<Range>& ranges, const void* p, uint64_t bytes) -> bool {
+            const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+            if (!a || bytes > std::numeric_limits<uintptr_t>::max() - a) return false;
+            const uintptr_t z = a + (uintptr_t) bytes;
+            for (const auto& r : ranges) if (a < r.last && r.first < z) return false;
+            ranges.push_back({a, z});
+            return true;
+        };
+        auto own_pool = [&](const strata::core::QsaState& st, const strata::core::ModelGeometry& geom,
+                            int mode, uint64_t& bytes) -> bool {
+            const auto shape = strata::core::qsa_shapes(geom);
+            const int64_t pages = (o.max_context + shape.page_size - 1) / shape.page_size;
+            if (st.host_allocation != strata::core::HostKvAllocation::Owned || st.host_descriptor ||
+                st.host.descriptor || st.kv_mode != mode || st.kv_elastic >= 0 ||
+                strata::core::qsa_kv_format(st) != strata::kernels::kKvF16 ||
+                st.max_cells != o.max_context || st.n_pages != pages || st.n_slots <= 0 || st.n_slots >= pages) {
+                e = "borrowed-target batch MTP: expected private owned streamed FP16 pools";
+                return false;
+            }
+            const uint64_t block = strata::kernels::kv_block_bytes(shape, strata::kernels::kKvF16);
+            const uint64_t payload = (uint64_t) pages * block, device_payload = (uint64_t) st.n_slots * block;
+            const uintptr_t hk = reinterpret_cast<uintptr_t>(st.host.k_pool);
+            const uintptr_t dk = reinterpret_cast<uintptr_t>(st.k_pool);
+            if (reinterpret_cast<uintptr_t>(st.host.v_pool) != hk + payload / 2 ||
+                reinterpret_cast<uintptr_t>(st.v_pool) != dk + device_payload / 2 ||
+                !add_range(host_ranges, st.host.k_pool, payload + 1024) ||
+                !add_range(device_ranges, st.k_pool, device_payload)) {
+                e = "borrowed-target batch MTP: missing, overlapping or malformed private K/V allocation";
+                return false;
+            }
+            bytes += payload + 1024;
+            return true;
+        };
+        for (int b = 0; b < 2; ++b) {
+            const auto& owner = *bslot_ss[0][(size_t) b];
+            if (owner.qsa_alloc != ss.qsa_alloc || owner.qsa_ord0 != ss.qsa_ord0) {
+                e = "borrowed-target batch MTP: incompatible target owner geometry";
+                return false;
+            }
+            for (int64_t j = 0; j < owner.qsa_alloc; ++j)
+                if (!own_pool(owner.qsa_states[owner.qsa_ord0 + j], g, 1, target_bytes)) return false;
+        }
+        const auto& owner = *bslot_ss[0][(size_t) main_host_owner];
+        for (int64_t j = 0; j < ss.qsa_alloc; ++j) {
+            const auto& view = ss.qsa_states[ss.qsa_ord0 + j];
+            const auto& src = owner.qsa_states[owner.qsa_ord0 + j];
+            if (view.host_allocation != strata::core::HostKvAllocation::Borrowed || !view.host_descriptor ||
+                view.host.descriptor != view.host_descriptor || view.kv_mode != 1 ||
+                view.host.k_pool != src.host.k_pool || view.host.v_pool != src.host.v_pool) {
+                e = "borrowed-target batch MTP: main target is not bound to its declared owner";
+                return false;
+            }
+        }
+        std::array<const strata::core::MtpDrafter*, 3> drafts{&mtp, slot_mtp[0].get(), slot_mtp[1].get()};
+        for (const auto* d : drafts) {
+            const auto& st = d->kv_state();
+            const auto shape = strata::core::qsa_shapes(draft_geometry);
+            const int64_t ring = o.mtp_window + 4 * (int64_t) d->max_t() + 64;
+            if (d->device() != 0 || st.n_slots != (ring + shape.page_size - 1) / shape.page_size ||
+                !own_pool(st, draft_geometry, 2, draft_bytes)) {
+                if (e.empty()) e = "borrowed-target batch MTP: actual draft device/ring differs from the plan";
+                return false;
+            }
+        }
+        if (strata::core::qsa_kv_host_bytes() != target_bytes + draft_bytes) {
+            e = "borrowed-target batch MTP: aggregate authoritative host K/V bytes differ from the owners";
+            return false;
+        }
+        std::fprintf(stderr, "strata: actual=host-kv-borrow-batch-mtp phase=%s target_owners=2 draft_owners=3 "
+                             "format=fp16 capacity=%lld target_host_bytes=%llu draft_host_bytes=%llu "
+                             "total_host_bytes=%llu target_verifier_max_rows=%d draft_handoff=direct\n", phase,
+                     (long long) o.max_context, (unsigned long long) target_bytes, (unsigned long long) draft_bytes,
+                     (unsigned long long) (target_bytes + draft_bytes), (int) strata::kernels::kVerifyMaxT);
+        for (size_t i = 0; i < drafts.size(); ++i) {
+            const auto& st = drafts[i]->kv_state();
+            std::fprintf(stderr, "strata: private draft owner=%zu host=%p pages=%lld ring_pages=%lld "
+                                 "reported_device_bytes=%llu\n", i, (const void*) st.host.k_pool,
+                         (long long) st.n_pages, (long long) st.n_slots,
+                         (unsigned long long) drafts[i]->vram_bytes());
+        }
+        return true;
+    };
+    if (!check_borrow_batch_mtp("loaded", err)) { std::fprintf(stderr, "strata: %s\n", err.c_str()); return 1; }
+
     // THE HEAD BEFORE THE CACHE, AND BEFORE THE ARENA.  The expert cache takes what is free minus the reserve, so
     // everything allocated after it comes out of the reserve.  The native head (~0.5 GB with IQ3_S) was loaded after
     // it and ate most of the 700 MiB: 128K IQ3_S ended with 30 MiB free, the driver paged, and a request stalled for
@@ -9216,6 +9317,7 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        if (!check_borrow_batch_mtp("bound", err)) { std::fprintf(stderr, "strata: %s\n", err.c_str()); return 1; }
         // each stage's verifier gets its stage's slot sessions
         if (o.batch > 0) {
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
@@ -11165,6 +11267,7 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
+        if (!check_borrow_batch_mtp("ready", err)) { std::fprintf(stderr, "strata: %s\n", err.c_str()); return 1; }
         strata::core::pin_sim_report("at READY");
         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
@@ -11467,6 +11570,24 @@ int main(int argc, char** argv) {
             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
             return true;
         };
+        // Combined borrowing/batch-MTP only: same authoritative bytes and ring refresh as save/restore, without
+        // a full-prefix temporary image. Drain even a failed copy before the caller terminates the request/process.
+        auto direct_draft_copy = [&](strata::core::MtpDrafter& from, strata::core::MtpDrafter& to,
+                                     int64_t upto, std::string& e) -> bool {
+            const strata::core::OnDevice on_mtp(mtp.device());
+            bool ok = from.idle(e) && to.idle(e);
+            if (ok) ok = strata::core::conversation_kv_copy(from.kv_state(), to.kv_state(),
+                                                           draft_geometry, upto, false, e);
+            const cudaError_t drained = cudaDeviceSynchronize();
+            if (drained != cudaSuccess) {
+                if (!e.empty()) e += "; ";
+                e += std::string("batch draft handoff: device drain failed: ") + cudaGetErrorString(drained);
+                return false;
+            }
+            if (!ok) return false;
+            to.set_prompt_len(upto);
+            return true;
+        };
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
             if (slot_host_kv_borrow) {
@@ -11504,7 +11625,9 @@ int main(int argc, char** argv) {
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
             }
-            if (batch_mtp) {
+            if (borrow_batch_mtp) {
+                if (!direct_draft_copy(mtp, *slot_mtp[(size_t) b], upto, e)) return false;
+            } else if (batch_mtp) {
                 // Admission first builds the solo draft KV; copy it into the slot before drafting.  Both drafters' K/V
                 // are on the drafter's device (the last stage's GPU with a layer split): the copy's ring refill is a
                 // kernel launch there.
@@ -11559,7 +11682,9 @@ int main(int argc, char** argv) {
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
             }
-            if (batch_mtp) {
+            if (borrow_batch_mtp) {
+                if (!direct_draft_copy(*slot_mtp[(size_t) b], mtp, upto, e)) return false;
+            } else if (batch_mtp) {
                 // A returning solo request resumes from its slot's draft KV (on the drafter's device, as above).
                 const strata::core::OnDevice on_mtp(mtp.device());
                 strata::core::ConversationKv image;
@@ -12864,6 +12989,11 @@ int main(int argc, char** argv) {
                 lent_slot = -1;   // (a longer start than the main session's)
                 const auto t0 = Clock::now();
                 if (!copy_from_slot(slot_source, slot_ck, err)) {
+                    if (borrow_batch_mtp) {
+                        std::fprintf(stderr, "strata: borrowed-target batch MTP slot restore failed: %s\n", err.c_str());
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;   // no prompt rebuild or state publication after a partial compound handoff
+                    }
                     // the main session may be half written: read this prompt from the start
                     std::fprintf(stderr, "strata batch: restoring slot %d failed (%s); reading the prompt\n",
                                  slot_source, err.c_str());
@@ -13613,6 +13743,11 @@ int main(int argc, char** argv) {
                         return true;
                     }
                     if (can) bs[(size_t) ys].cached = false;   // half written
+                    if (can && borrow_batch_mtp) {
+                        batch_fatal = true;
+                        err = ye.empty() ? "borrowed-target batch MTP partial-prompt handoff failed" : ye;
+                        return true;   // stop the read; no yielded_at was published, so its fatal path terminates
+                    }
                     std::fprintf(stderr, "strata batch: BYIELD %d not taken at %lld of %lld%s%s\n", ys, (long long) q,
                                  (long long) n, ye.empty() ? "" : ": ", ye.c_str());
                     return false;
@@ -15482,6 +15617,10 @@ int main(int argc, char** argv) {
                 if (cont && !copy_to_slot(admit_slot, live, err)) {
                     std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
                     bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
+                    if (borrow_batch_mtp) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;   // never publish a successful compound admission after a partial copy
+                    }
                     cont = false;
                 }
                 const auto tc1 = Clock::now();

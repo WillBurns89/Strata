@@ -249,8 +249,9 @@ bool MtpDrafter::make_q4_head(std::string& err) {
 }
 
 bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
-                      int64_t window, const MtpDrafter* shared) {
+                      int64_t window, const MtpDrafter* shared, bool require_streamed_fp16) {
 #if defined(STRATA_GPU_METAL)
+    if (require_streamed_fp16) { err = "mtp: required private streamed FP16 state is unsupported on Metal"; return false; }
     (void) window; (void) shared;
     g_ = &g;
     ss_ = &ss;
@@ -343,6 +344,14 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     // window (plus the cells a round writes ahead of its queries) over a host copy, refilled on a resume. The host copy
     // is pinned after the expert arena has pinned what it could: if it does not fit, the K/V stays whole in VRAM.
     int64_t ring = (window > 0 && window < max_cells) ? window + 4 * (int64_t) max_t + 64 : 0;
+    if (require_streamed_fp16 &&
+        (max_cells != 262144 || window <= 0 || window >= max_cells - 4 * (int64_t) max_t - 64 ||
+         (ring + s.page_size - 1) / s.page_size >= (max_cells + s.page_size - 1) / s.page_size ||
+         qsa_kv_resident() <= 0 || std::getenv("STRATA_KV_RING_OFF") != nullptr ||
+         qsa_kv_int8() || qsa_kv_q4() || qsa_kv_hybrid() || qsa_kv_elastic())) {
+        err = "mtp: borrowed-target batch MTP requires a private 262144-capacity streamed FP16 ring";
+        return false;
+    }
     // K8V4 never applies to the drafter: its own attention paths (below, and verify.cpp) handle whole formats
     // only, whatever ring shape it takes (0, a window, or the -1 fully-resident fallback).
     const bool kv_hybrid_was = qsa_kv_hybrid();
@@ -352,6 +361,12 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
     if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
     if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
+        if (require_streamed_fp16) {
+            qsa_set_kv_int8(kv_int8_was);
+            qsa_set_kv_hybrid(kv_hybrid_was);
+            err = "mtp: required private streamed FP16 state allocation failed; full-VRAM fallback is forbidden";
+            return false;
+        }
         if (st_.kv_mode == 0) { err = "mtp: state init failed"; return false; }
         std::fprintf(stderr, "strata mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM\n");
         cudaGetLastError();
@@ -364,6 +379,15 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     }
     qsa_set_kv_int8(kv_int8_was);
     qsa_set_kv_hybrid(kv_hybrid_was);
+    if (require_streamed_fp16 &&
+        (st_.kv_mode != 2 || qsa_kv_format(st_) != strata::kernels::kKvF16 ||
+         st_.host_allocation != HostKvAllocation::Owned || st_.host_descriptor || st_.host.descriptor ||
+         !st_.host.k_pool || !st_.host.v_pool || st_.max_cells != max_cells ||
+         st_.n_pages != (max_cells + s.page_size - 1) / s.page_size ||
+         st_.n_slots != (ring + s.page_size - 1) / s.page_size || st_.n_slots >= st_.n_pages)) {
+        err = "mtp: actual private streamed FP16 state does not match the required allocation";
+        return false;
+    }
     qsa_state_zero(st_, g, nullptr);
     cudaDeviceSynchronize();
     vram_ += sb;

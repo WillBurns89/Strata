@@ -43,8 +43,10 @@ public:
 
     /// Loads `rt_dir` (from tools/mtp_rt.py) and allocates the layer's K/V and buffers for up to `max_t` rows.
     /// Call before the VRAM expert tier is sized: this takes ~0.9 GB.
+    /// `require_streamed_fp16`: the borrowed-target/batch-MTP experiment requires a private FP16 ring plus
+    /// authoritative host pool; a disabled ring or pinning failure is fatal, without a full-VRAM fallback.
     bool load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
-              int64_t window = 32768, const MtpDrafter* shared = nullptr);
+              int64_t window = 32768, const MtpDrafter* shared = nullptr, bool require_streamed_fp16 = false);
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
     /// STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, opt-in, changes the output): the draft layer's router is biased like
