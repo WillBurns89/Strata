@@ -166,6 +166,7 @@ class Engine:
 def owner_reversal(a, cfg, prompts):
     """Two native slot assignments, reversed after a complete drain; no profile or arithmetic overrides."""
     result = {"mode": "owner_reversal", "pass": False, "solo": [], "rounds": [],
+              "collection_complete": False, "solo_mismatches": [],
               "config_sha256": hashlib.sha256(Path(a.config).read_bytes()).hexdigest(),
               "args": list(cfg["args"]), "profile_env": cfg.get("env", {}),
               "limitations": ["Short text only: capacity and vision remain configured, not exercised here.",
@@ -258,10 +259,18 @@ def owner_reversal(a, cfg, prompts):
                 raise ValueError("UNSUPPORTED: no overlap of the two admitted slots")
             for row in records:
                 row["matches_solo"] = row["tokens"] == result["solo"][row["prompt"]]["tokens"]
-                if not row["matches_solo"] or not row["tokens"] or row["terminal"] is None:
-                    raise ValueError("Slot output differs from its solo reference")
+                if not row["tokens"] or row["terminal"] is None:
+                    raise ValueError("Slot output did not complete normally")
+                if not row["matches_solo"]:
+                    result["solo_mismatches"].append({"round": len(result["rounds"]) - 1,
+                                                       "prompt": row["prompt"], "slot": row["slot"]})
                 if assignment == (1, 0) and row["reused"] <= 0:
                     raise ValueError("Reversed assignment did not exercise prefix reuse")
+        result["collection_complete"] = True
+        # A drained solo/batch mismatch is evidence, not a reason to omit the reversed assignment.
+        # Preserve the original parity failure after collecting both complete BGEN schedules.
+        if result["solo_mismatches"]:
+            raise ValueError("Slot output differs from its solo reference")
         result["pass"] = True
     except (Exception, SystemExit) as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
