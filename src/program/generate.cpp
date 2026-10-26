@@ -12929,8 +12929,18 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
-            req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
+            // Validate the expanded request before allocating image rows or writing its position table.
+            // max_new is positive here; ordered subtraction keeps n + max_new + 8 from overflowing.
+            if (n > o.max_context || max_new > o.max_context - n || o.max_context - n - max_new < 8) {
+                std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
+                            (long long) max_new, (long long) o.max_context);
+                continue;
+            }
+            bool bad = false;
+            for (int64_t t : ids) bad = bad || t < 0 || t >= n_vocab;
+            if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); continue; }
+            req_imgs.clear();
             if (geni || !mrope_identity) {
                 // positions for every cell this request can reach; the identity again for a text request
                 std::string ve;
@@ -12947,6 +12957,9 @@ int main(int argc, char** argv) {
                     struct Img { int64_t n, nx, ny; size_t off; };
                     std::vector<Img> imgs;
                     img_rows.clear();
+                    size_t pads_left = (size_t) std::count(ids.begin(), ids.end(), kImagePad), pad_at = 0;
+                    const size_t max_floats = std::min(img_rows.max_size(),
+                                                       std::numeric_limits<size_t>::max() / sizeof(float));
                     std::FILE* f = std::fopen(emb_path.c_str(), "rb");
                     if (!f) ve = "cannot open " + emb_path;
                     while (f && ve.empty()) {
@@ -12954,15 +12967,31 @@ int main(int argc, char** argv) {
                         const size_t got = std::fread(hdr, sizeof(int32_t), 5, f);
                         if (got == 0) break;
                         if (got != 5 || hdr[0] != 0x31455653 || hdr[1] < 1 || hdr[2] < 1 || hdr[3] < 1 ||
-                            (int64_t) hdr[2] * hdr[3] != hdr[1] || hdr[4] != (int32_t) g.n_embd) {
+                            (int64_t) hdr[2] * hdr[3] != hdr[1] || hdr[4] < 1 || (int64_t) hdr[4] != g.n_embd) {
                             ve = "bad embeddings file (expected strata-vision records of width " +
                                  std::to_string((long long) g.n_embd) + ")";
                             break;
                         }
-                        const size_t off = img_rows.size(), cnt = (size_t) hdr[1] * (size_t) hdr[4];
+                        // Consume the same pad positions as the geometry pass, before trusting any file-sized allocation.
+                        // A run may contain consecutive records; do not require an artificial image delimiter.
+                        const size_t rows = (size_t) hdr[1], width = (size_t) hdr[4];
+                        while (pad_at < ids.size() && ids[pad_at] != kImagePad) ++pad_at;
+                        if (pad_at == ids.size()) { ve = "the embeddings file has more images than the prompt"; break; }
+                        if (rows > pads_left || rows > ids.size() - pad_at ||
+                            !std::all_of(ids.begin() + pad_at, ids.begin() + pad_at + rows,
+                                         [](int64_t t) { return t == kImagePad; })) {
+                            ve = "image " + std::to_string(imgs.size() + 1) + " has " + std::to_string(hdr[1]) +
+                                 " rows but fewer <|image_pad|> tokens";
+                            break;
+                        }
+                        if (rows > max_floats / width) { ve = "embeddings file size exceeds addressable storage"; break; }
+                        const size_t off = img_rows.size(), cnt = rows * width;
+                        if (off > max_floats - cnt) { ve = "embeddings file size exceeds addressable storage"; break; }
                         img_rows.resize(off + cnt);
                         if (std::fread(img_rows.data() + off, sizeof(float), cnt, f) != cnt) { ve = "short embeddings file"; break; }
                         imgs.push_back({hdr[1], hdr[2], hdr[3], off});
+                        pads_left -= rows;
+                        pad_at += rows;
                     }
                     if (f) std::fclose(f);
                     int64_t p = 0, i = 0;
@@ -13024,14 +13053,6 @@ int main(int argc, char** argv) {
                 mrope_identity = !geni;
             }
             sp.embd_rows = geni ? row_ptr.data() : nullptr;
-            if (n + max_new + 8 > o.max_context) {
-                std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
-                            (long long) max_new, (long long) o.max_context);
-                continue;
-            }
-            bool bad = false;
-            for (int64_t t : ids) bad = bad || t < 0 || t >= n_vocab;
-            if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); continue; }
             std::array<int64_t, 3> remote_before{};
             std::array<int64_t, 3> launches_before{};
             std::array<uint64_t, 3> compact_before{}, full_before{};
