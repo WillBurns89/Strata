@@ -3457,8 +3457,11 @@ uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
 bool FileExpertSource::pin_cache_complement(
     const ExpertCache& cache, std::string& err, bool pin,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
-    uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank) {
+    uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank,
+    uint64_t lend_reserve_bytes, const std::string& map_file) {
     err.clear();
+    const bool fixed_receipt = lend_reserve_bytes > 0 || !map_file.empty();
+    const int64_t requested_lend_from = lend_from_slot;
     const auto pin_t0 = std::chrono::steady_clock::now();
     if (base_ == nullptr) { err = "FileExpertSource: open the mapped experts before pinning a complement"; return false; }
     if (complement_ready_) { err = "FileExpertSource: the cache complement is already pinned"; return false; }
@@ -3466,6 +3469,32 @@ bool FileExpertSource::pin_cache_complement(
     if (cache.fills() != cache.resident()) {
         err = "FileExpertSource: the GPU expert cache is not fully filled";
         return false;
+    }
+    if (fixed_receipt) {
+#if !defined(_WIN32) || defined(STRATA_USE_HIP) || defined(STRATA_GPU_METAL) || defined(STRATA_USE_SYCL)
+        err = "FileExpertSource: reserved loan residency/map capture supports only Windows CUDA";
+        return false;
+#else
+        if (!pin || budget_bytes == 0 || budget_bytes == kResidentWhatFits ||
+            lend_reserve_bytes >= budget_bytes || map_file.empty() || !std::filesystem::u8path(map_file).is_absolute() ||
+            !additional_gpu_pairs.empty() || !stage_lend_regions_.empty() ||
+            cache.resident() != cache.slots() || lend_from_slot < 0 || lend_from_slot >= cache.slots() ||
+            rank == nullptr || rank->size() != (size_t) n_layers_ * (size_t) n_expert_) {
+            err = "FileExpertSource: reserved loan residency/map capture requires a pinned explicit budget, "
+                  "a smaller reserve, map path, full single-GPU cache/rank and known loan range";
+            return false;
+        }
+        std::vector<bool> seen(rank->size(), false);
+        for (const auto& pr : *rank) {
+            if (pr.first < 0 || pr.first >= n_layers_ || pr.second < 0 || pr.second >= n_expert_) {
+                err = "FileExpertSource: fixed resident rank contains an out-of-range expert";
+                return false;
+            }
+            const size_t i = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
+            if (seen[i]) { err = "FileExpertSource: fixed resident rank contains a duplicate expert"; return false; }
+            seen[i] = true;
+        }
+#endif
     }
     const cudaError_t sync = cudaDeviceSynchronize();
     if (sync != cudaSuccess) {
@@ -3485,6 +3514,10 @@ bool FileExpertSource::pin_cache_complement(
         for (int64_t expert = 0; expert < n_expert_; ++expert) {
             const int32_t slot = cache.slot_of(layer, expert);
             if (slot == kNotResident) continue;
+            if (fixed_receipt && (slot < 0 || slot >= n_slots || slot_bytes[(size_t) slot] != 0)) {
+                err = "FileExpertSource: fixed GPU map has an invalid or duplicate slot";
+                return false;
+            }
             primary_gpu_pairs.emplace_back((int32_t) layer, (int32_t) expert);
             pair_slot.push_back(slot);
             if (slot >= 0 && slot < n_slots) slot_bytes[(size_t) slot] = layer_blob_bytes_[(size_t) layer];
@@ -3526,6 +3559,11 @@ bool FileExpertSource::pin_cache_complement(
         const char* limit = budget_commit < physical ? "commit" : "RAM";
         const uint64_t clamped = detail::clamp_resident_budget(budget_bytes, physical, budget_commit, headroom_bytes);
         if (budget_bytes > clamped) {
+            if (fixed_receipt) {
+                err = "FileExpertSource: fixed resident budget would be clamped from " +
+                      std::to_string(budget_bytes) + " to " + std::to_string(clamped) + " bytes; refusing";
+                return false;
+            }
             // #403: 256 MiB under the room, so the engine's own allocations after this reading still leave the
             // headroom (a budget clamped to exactly the room failed the safety check below on a reading a few MB
             // lower).  An unclamped budget is unchanged.
@@ -3542,6 +3580,7 @@ bool FileExpertSource::pin_cache_complement(
             budget_bytes = clamped;
         }
         std::vector<uint64_t> ranked(offsets.size(), kNoComplement);
+        const uint64_t ranked_cap = budget_bytes - lend_reserve_bytes;
         uint64_t at = 0;
         int64_t held = 0;
         if (rank != nullptr)
@@ -3550,7 +3589,7 @@ bool FileExpertSource::pin_cache_complement(
                 const size_t i = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
                 if (offsets[i] == kNoComplement || ranked[i] != kNoComplement) continue;   // on a GPU, or twice
                 const uint64_t b = layer_blob_bytes_[(size_t) pr.first];
-                if (b > budget_bytes - at) continue;
+                if (b > ranked_cap - at) continue;
                 ranked[i] = at;
                 at += b;
                 ++held;
@@ -3577,11 +3616,13 @@ bool FileExpertSource::pin_cache_complement(
                 if (pair_slot[i] >= lend_from_slot && pair_slot[i] < n_slots) order.push_back(i);
             std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return pair_slot[a] > pair_slot[b]; });
             const uint64_t at0 = at;
+            // The reserved arm cannot spend spare ranked bytes on backups, or vice versa.
+            const uint64_t lend_cap = lend_reserve_bytes > 0 ? at0 + lend_reserve_bytes : budget_bytes;
             for (size_t i : order) {
                 const auto& pr = primary_gpu_pairs[i];
                 const size_t idx = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
                 const uint64_t b = layer_blob_bytes_[(size_t) pr.first];
-                if (b > budget_bytes - at) break;   // a contiguous tail of the region: a short prompt lends only the last few
+                if (b > lend_cap - at) break;   // a contiguous tail of the region: a short prompt lends only the last few
                 if (ranked[idx] != kNoComplement) continue;
                 ranked[idx] = at;
                 at += b;
@@ -3590,7 +3631,11 @@ bool FileExpertSource::pin_cache_complement(
             std::fprintf(stderr, "FileExpertSource: the prompt path's lend region: %lld of its %lld slots keep their experts "
                                  "in RAM too (%.2f GiB of the budget's remaining %.2f GiB)\n",
                          (long long) budget_lent, (long long) budget_lendable, (double) (at - at0) / 1073741824.0,
-                         (double) (budget_bytes - at0) / 1073741824.0);
+                         (double) (lend_cap - at0) / 1073741824.0);
+            if (lend_reserve_bytes > 0 && budget_lent == 0) {
+                err = "FileExpertSource: reserved loan budget cannot hold the last GPU expert; refusing empty protection";
+                return false;
+            }
         }
         offsets.swap(ranked);
         bytes = at;
@@ -3807,6 +3852,10 @@ bool FileExpertSource::pin_cache_complement(
             }
         }
         if (arena == nullptr) {
+            if (fixed_receipt) {
+                err = "FileExpertSource: fixed resident allocation requires mapped page-locked memory; " + note;
+                return false;
+            }
             if (!note.empty()) {
                 std::fprintf(stderr, "FileExpertSource: %s; trying pageable memory\n", note.c_str());
                 log_complement_memory("before pageable allocation", bytes);
@@ -4103,6 +4152,97 @@ bool FileExpertSource::pin_cache_complement(
         h = fnv1a64((const uint8_t*) ph.data(), (uint64_t) (ph.size() * sizeof(uint64_t)), h);
         std::fprintf(stderr, "FileExpertSource: cache complement checksum %016llx (%.2f GiB, its offsets included)\n",
                      (unsigned long long) h, (double) bytes / 1073741824.0);
+    }
+
+    if (fixed_receipt) {
+#if defined(_WIN32)
+        // Record the maps that completed allocation and copying, not merely the requested rank. The receipt
+        // describes admission metadata, not a GPU-content readback. Its identity hashes are computed externally.
+        if (!pinned_ok || host == nullptr || device == nullptr || bytes == 0) {
+            err = "FileExpertSource: fixed resident admission did not produce a fully mapped pinned arena";
+            release();
+            return false;
+        }
+        std::vector<size_t> gpu_order(primary_gpu_pairs.size()), ram_order;
+        for (size_t i = 0; i < gpu_order.size(); ++i) gpu_order[i] = i;
+        std::sort(gpu_order.begin(), gpu_order.end(), [&](size_t a, size_t b) { return pair_slot[a] < pair_slot[b]; });
+        for (size_t i = 0; i < offsets.size(); ++i) if (offsets[i] != kNoComplement) ram_order.push_back(i);
+        std::sort(ram_order.begin(), ram_order.end(), [&](size_t a, size_t b) { return offsets[a] < offsets[b]; });
+        uint64_t original_bytes = 0, backup_bytes = 0, next_offset = 0;
+        int64_t original_count = 0, backup_count = 0;
+        std::ostringstream rows;
+        rows << "role\tordinal\tlayer\texpert\tgpu_slot\tbyte_offset\tbytes\n";
+        for (size_t ordinal = 0; ordinal < gpu_order.size(); ++ordinal) {
+            const size_t i = gpu_order[ordinal];
+            const auto& pr = primary_gpu_pairs[i];
+            rows << "gpu\t" << ordinal << '\t' << pr.first << '\t' << pr.second << '\t' << pair_slot[i]
+                 << '\t' << cache.slot_offset(pair_slot[i]) << '\t' << layer_blob_bytes_[(size_t) pr.first] << '\n';
+        }
+        for (size_t ordinal = 0; ordinal < ram_order.size(); ++ordinal) {
+            const size_t i = ram_order[ordinal];
+            const int64_t layer = (int64_t) (i / (size_t) n_expert_);
+            const int64_t expert = (int64_t) (i % (size_t) n_expert_);
+            const int32_t slot = cache.slot_of(layer, expert);
+            const uint64_t length = layer_blob_bytes_[(size_t) layer];
+            if (offsets[i] != next_offset || next_offset > bytes || length > bytes - next_offset ||
+                (slot != kNotResident && slot < requested_lend_from)) {
+                err = "FileExpertSource: admitted resident map has a gap, invalid bound or non-loan GPU duplicate";
+                release();
+                return false;
+            }
+            next_offset += length;
+            if (slot == kNotResident) { original_bytes += length; ++original_count; }
+            else { backup_bytes += length; ++backup_count; }
+            rows << (slot == kNotResident ? "original" : "loan_backup") << '\t' << ordinal << '\t' << layer
+                 << '\t' << expert << '\t' << slot << '\t' << offsets[i] << '\t' << length << '\n';
+        }
+        if (next_offset != bytes || (lend_reserve_bytes > 0 &&
+            (original_bytes > budget_bytes - lend_reserve_bytes || backup_bytes > lend_reserve_bytes))) {
+            err = "FileExpertSource: admitted map does not satisfy the fixed resident allocation envelope";
+            release();
+            return false;
+        }
+        std::ostringstream receipt;
+        receipt << "# strata-resident-map-v1\n# state=after-successful-pinned-copy\n"
+                << "# total_budget_bytes=" << budget_bytes << " reserve_bytes=" << lend_reserve_bytes
+                << " loan_first_slot=" << requested_lend_from << " loan_end_slot=" << n_slots << '\n'
+                << "# gpu_count=" << primary_gpu_pairs.size() << " gpu_arena_bytes=" << cache.bytes()
+                << " original_count=" << original_count << " original_bytes=" << original_bytes
+                << " backup_count=" << backup_count << " backup_bytes=" << backup_bytes
+                << " resident_bytes=" << bytes << " pinned_bytes=" << bytes << '\n'
+                << rows.str() << "# complete\n";
+        const std::string payload = receipt.str();
+        const HANDLE file = CreateFileW(std::filesystem::u8path(map_file).c_str(), GENERIC_WRITE, 0, nullptr,
+                                        CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            err = "FileExpertSource: cannot exclusively create resident map receipt (Windows error " +
+                  std::to_string(GetLastError()) + "): " + map_file;
+            release();
+            return false;
+        }
+        DWORD write_error = ERROR_SUCCESS;
+        for (size_t at = 0; at < payload.size();) {
+            const DWORD requested = (DWORD) std::min<size_t>(payload.size() - at, 1u << 20);
+            DWORD written = 0;
+            if (!WriteFile(file, payload.data() + at, requested, &written, nullptr)) { write_error = GetLastError(); break; }
+            if (written == 0) { write_error = ERROR_WRITE_FAULT; break; }
+            at += written;
+        }
+        if (write_error == ERROR_SUCCESS && !FlushFileBuffers(file)) write_error = GetLastError();
+        if (!CloseHandle(file) && write_error == ERROR_SUCCESS) write_error = GetLastError();
+        if (write_error != ERROR_SUCCESS) {
+            err = "FileExpertSource: resident map receipt failed; do not accept the partial file (Windows error " +
+                  std::to_string(write_error) + "): " + map_file;
+            release();
+            return false;
+        }
+        std::fprintf(stderr, "FileExpertSource: fixed resident admission: original %lld experts / %llu bytes; "
+                             "loan backups %lld experts / %llu bytes; total %llu bytes; receipt %s\n",
+                     (long long) original_count, (unsigned long long) original_bytes, (long long) backup_count,
+                     (unsigned long long) backup_bytes, (unsigned long long) bytes, map_file.c_str());
+        std::fprintf(stderr, "FileExpertSource: pinned loan backups may change CPU/GPU execution placement during "
+                             "prompt borrowing; admission identity alone does not prove numerical parity\n");
+#endif
     }
 
     complement_arena_ = arena;

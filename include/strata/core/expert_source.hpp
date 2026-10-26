@@ -736,17 +736,22 @@ public:
     ///
     /// CS-T, `budget_bytes` > 0 (`--resident-budget-gib`): only as many of those experts as fit `budget_bytes`, taken
     /// in `rank` order (the expert profile: the hottest after the GPU cache's), are copied; the rest stay on the
-    /// mapped files (the SSD tier).  No lend region then (a lent slot's expert is read from the files).
+    /// mapped files (the SSD tier). Remaining budget may keep a contiguous tail of the lend region too.
     /// Available memory is limited by both RAM and commit capacity on Windows.
     /// #467: `budget_bytes` = `kResidentWhatFits` sizes that path from available memory minus headroom and the #403
     /// margin - the soft --resident-experts mode's second try when the whole complement does not fit;
     /// false when not even one expert fits.  On Windows the mapped experts leave the working set before any reading.
+    /// Experimental Windows CUDA fixed placement: `lend_reserve_bytes` partitions an explicit budget into a
+    /// ranked non-GPU cap and a separate loan-backup cap. Unused bytes of either cap are not recycled. Nonzero
+    /// reserve requires `map_file`, an exclusive-created actual-admission TSV after successful pinning/copying.
+    /// A map alone captures the matched zero-reserve control. Both modes reject clamping and allocation fallback.
     static constexpr uint64_t kResidentWhatFits = ~0ull;
     bool pin_cache_complement(
         const ExpertCache& cache, std::string& err, bool pin = true,
         const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs = {}, int64_t lend_from_slot = -1,
         uint64_t headroom_bytes = 8ull << 30, uint64_t budget_bytes = 0,
-        const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr);
+        const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr,
+        uint64_t lend_reserve_bytes = 0, const std::string& map_file = {});
     /// A layer split: the prompt path borrows the TAIL SLOTS of every stage's cache - CUDA0's own part
     /// first, then every stage in order.  Set these BEFORE `pin_cache_complement` to keep those slots' experts
     /// in the RAM copy too: each region lists its stage's (layer, expert) pairs, the highest cache slot first,

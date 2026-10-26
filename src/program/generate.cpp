@@ -2766,6 +2766,61 @@ int main(int argc, char** argv) {
         }
         }
     }
+    // Restart-only placement experiment. Parse before loading weights; never turn a typo into a zero reserve.
+    uint64_t resident_lend_reserve_bytes = 0;
+    if (const char* v = std::getenv("STRATA_RESIDENT_LEND_RESERVE_MIB")) {
+        uint64_t mib = 0;
+        const uint64_t max_mib = std::numeric_limits<uint64_t>::max() >> 20;
+        bool valid = v[0] != '\0';
+        for (const char* p = v; valid && *p; ++p) {
+            if (*p < '0' || *p > '9' || mib > (max_mib - (uint64_t) (*p - '0')) / 10) valid = false;
+            else mib = mib * 10 + (uint64_t) (*p - '0');
+        }
+        if (!valid) {
+            std::fprintf(stderr, "strata: STRATA_RESIDENT_LEND_RESERVE_MIB must be an unsigned decimal integer MiB "
+                                 "without overflow (0 disables it)\n");
+            return 2;
+        }
+        resident_lend_reserve_bytes = mib << 20;
+    }
+    const char* resident_map_env = std::getenv("STRATA_RESIDENT_MAP_FILE");
+    const std::string resident_map_file = resident_map_env != nullptr ? resident_map_env : "";
+    const bool fixed_resident_receipt = resident_lend_reserve_bytes > 0 || resident_map_env != nullptr;
+    if (fixed_resident_receipt) {
+#if !defined(_WIN32) || defined(STRATA_USE_HIP) || defined(STRATA_GPU_METAL) || defined(STRATA_USE_SYCL)
+        std::fprintf(stderr, "strata: reserved loan residency/map capture supports only Windows CUDA\n");
+        return 2;
+#else
+        bool remote = false;
+        for (const int n : o.expert_cache_remote) remote = remote || n != 0;
+        for (const bool a : o.expert_cache_remote_auto) remote = remote || a;
+        bool ram_adapt = false;
+        for (const char* name : {"STRATA_RAM_ADAPT", "STRATA_RAM_ADAPT2", "STRATA_EXCHANGE_ROTATE"})
+            if (const char* v = std::getenv(name)) ram_adapt = ram_adapt || std::strcmp(v, "0") != 0;
+        const char* pd = std::getenv("STRATA_PRIMARY_DEVICE");
+        const char* kg = std::getenv("STRATA_KV_GROW");
+        if (!o.serve || !o.mmap_experts || !o.resident_cpu_experts || !o.resident_pin ||
+            o.resident_budget == 0 || resident_lend_reserve_bytes >= o.resident_budget ||
+            o.expert_cache <= 0 || o.expert_profile.empty() || o.expert_cache_per_layer ||
+            o.vram_elastic || o.kv_grow || (kg && kg[0] && kg[0] != '0') ||
+            !o.layer_split.empty() || o.peer_device >= 0 || remote || o.remote_expert_opt ||
+            !o.shared_expert_arena.empty() || (pd && std::strcmp(pd, "0") != 0) ||
+            (o.adapt_every > 0 && o.adapt_swaps > 0) || o.adapt_async || ram_adapt ||
+            o.no_prefill_borrow || o.prefill_chunk <= 0 || o.no_pool) {
+            std::fprintf(stderr, "strata: reserved loan residency/map capture requires --serve, pinned explicit "
+                                 "resident budget larger than reserve, fixed profiled cache on one primary CUDA GPU, "
+                                 "prompt borrowing, and no split/peer/remote/elastic/per-layer cache or adaptation\n");
+            return 2;
+        }
+        std::error_code map_ec;
+        if (resident_map_file.empty() || !std::filesystem::u8path(resident_map_file).is_absolute() ||
+            std::filesystem::exists(std::filesystem::u8path(resident_map_file), map_ec) || map_ec) {
+            std::fprintf(stderr, "strata: STRATA_RESIDENT_MAP_FILE must name a fresh absolute TSV path; "
+                                 "existing paths are never overwritten\n");
+            return 2;
+        }
+#endif
+    }
     const char* host_kv_borrow_env = std::getenv("STRATA_SLOT_HOST_KV_BORROW");
     const bool slot_host_kv_borrow = host_kv_borrow_env != nullptr && std::strcmp(host_kv_borrow_env, "1") == 0;
     if (host_kv_borrow_env != nullptr && host_kv_borrow_env[0] != '\0' &&
@@ -6227,6 +6282,11 @@ int main(int argc, char** argv) {
         const size_t keep_free = ((size_t) o.vram_reserve_mib << 20) + (size_t) pipe_first;
         size_t free_room = free_b > keep_free ? free_b - keep_free : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
+        if (fixed_resident_receipt && cap < budget) {
+            std::fprintf(stderr, "strata generate: fixed GPU budget would be clamped from %llu to %llu bytes; refusing\n",
+                         (unsigned long long) budget, (unsigned long long) cap);
+            return 1;
+        }
         for (const auto& pr : profile) {
             const uint64_t b = (uint64_t) strata::core::ExpertCache::slot_stride((int64_t) lay.blob_bytes(pr.first), slot_guard);
             if (used + b > cap) break;
@@ -8165,7 +8225,12 @@ int main(int argc, char** argv) {
         }
         const std::vector<std::pair<int32_t, int32_t>>& rank_all = profile_all.empty() ? profile : profile_all;
         bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from,
-                                                    o.resident_headroom, o.resident_budget, &rank_all);
+                                                    o.resident_headroom, o.resident_budget, &rank_all,
+                                                    resident_lend_reserve_bytes, resident_map_file);
+        if (!resident_ok && fixed_resident_receipt) {
+            std::fprintf(stderr, "strata generate: fixed resident admission failed; no retry/fallback: %s\n", err.c_str());
+            return 1;
+        }
         std::string whole_err;
         if (!resident_ok && o.resident_soft) {
             // #467: the whole complement does not fit - keep what does, the hottest by the profile, through the #403
@@ -8207,7 +8272,8 @@ int main(int argc, char** argv) {
                                  "%s keeps them all in RAM\n",
                          (long long) o.prefill_chunk, (long long) (xcache.slots() - lend_from),
                          (long long) src.resident_lent_slots(),
-                         o.resident_budget > 0 ? "A larger --resident-budget-gib (the lend region comes after the ranked experts), or a smaller --prefill,"
+                         resident_lend_reserve_bytes > 0 ? "A larger STRATA_RESIDENT_LEND_RESERVE_MIB within the total budget, or a smaller --prefill,"
+                         : o.resident_budget > 0 ? "A larger --resident-budget-gib (the lend region comes after the ranked experts), or a smaller --prefill,"
                                                : "A smaller --prefill, or auto,");
         if (resident_ok) {
             // --adapt-async: twice the exchange buffers - the second half bounces the copies in whose source is not
