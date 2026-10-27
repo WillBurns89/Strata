@@ -57,6 +57,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -967,6 +968,7 @@ struct Prefill::Impl {
     // only write stream_all_min() - 1 of its rows into them; fused_layout() keeps the two in step (#583, #954)
     bool fused_bufs = false;
     bool expert_scratch = false;   // opt-in: only one FP16 expert owns Xs/GU/Hh at a time
+    bool hc_scratch = false;       // opt-in: HC gated output precedes the shared scratch users on cs
     std::unique_ptr<Stager> stager;          // the unpinned experts' host copies (step 4)
     cudaEvent_t copied[RING_MAX] = {}, used[RING_MAX] = {};
     bool stage_live[RING_MAX] = {};
@@ -1291,6 +1293,26 @@ const char* expert_scratch_rejection(int64_t n_expert, bool fused) {
 bool expert_scratch_active(int64_t n_expert, bool fused) {
     return expert_scratch_requested() && expert_scratch_rejection(n_expert, fused) == nullptr;
 }
+// Restart-only: HC's gated output is dead after gr_mix[_r] on the compute stream,
+// before GDN/QSA/MoE reuse this region. Keep every other HC input/output separate.
+bool hc_scratch_requested() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_PREFILL_HC_SCRATCH"); return e && e[0] == '1'; }();
+    return on;
+}
+const char* hc_scratch_rejection(int64_t n_expert, bool fused) {
+    if (!expert_scratch_requested()) return "HC scratch requires STRATA_PREFILL_EXPERT_SCRATCH=1";
+    return expert_scratch_rejection(n_expert, fused);
+}
+bool hc_scratch_active(int64_t n_expert, bool fused) {
+    return hc_scratch_requested() && hc_scratch_rejection(n_expert, fused) == nullptr;
+}
+uint64_t hc_set_bytes(size_t T) {
+    // Alloc::take adds its guard/alignment bytes after multiplying the elements.
+    if (T == 0 || T > (std::numeric_limits<size_t>::max() - 511) / (D * sizeof(float))) return 0;
+    Alloc a; a.count_only = true; bool ok = true;
+    a.take<float>(T * D, ok);
+    return a.used;
+}
 bool dbg_nan() {
     static const bool on = std::getenv("STRATA_DBG_NAN") != nullptr;
     return on;
@@ -1396,6 +1418,18 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                    core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
                    void* stream, std::string& err, void* borrow, uint64_t borrow_bytes, bool borrow_spill) {
     Impl& m = *impl_;
+    if (hc_scratch_requested()) {
+        const char* why = hc_scratch_rejection(g.n_expert, false);
+        if (why == nullptr && (chunk <= 0 || stage_lb_ != 0 || (stage_le_ >= 0 && stage_le_ != g.n_layers) ||
+                               next_ != nullptr || helper_ != nullptr || hand_in_ != nullptr || m.pp || m.help_pp))
+            why = "HC scratch requires a positive chunk and a single full-model stage without a peer/helper";
+        if (why == nullptr && hc_set_bytes((size_t) chunk) == 0) why = "HC scratch size overflows its allocation";
+        if (why != nullptr) {
+            err = std::string("prefill: ") + why;
+            std::fprintf(stderr, "strata: prompt HC scratch requested=1 actual=unavailable: %s\n", why);
+            return false;
+        }
+    }
     if (expert_scratch_requested()) {
         const char* why = expert_scratch_rejection(g.n_expert, false);
         if (why == nullptr && (chunk <= 0 || stage_lb_ != 0 || (stage_le_ >= 0 && stage_le_ != g.n_layers) ||
@@ -1612,11 +1646,14 @@ bool Prefill::carve(size_t T, void* alloc) {
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     bool ok = true;
+    m.hc_scratch = hc_scratch_requested() && hc_scratch_active(g.n_expert, fused_layout(T, m.src != nullptr));
+    const uint64_t hc_bytes = m.hc_scratch ? hc_set_bytes(T) : 0;
+    if (hc_scratch_requested() && (!m.hc_scratch || hc_bytes == 0)) return false;
     m.emb = o.take<float>(T * N, ok); m.R = o.take<float>(T * D, ok);
     m.xn = gr_unfused() ? o.take<float>(T * D, ok) : nullptr;   // F-1: not needed (gr_mix_r reads R)
     m.grs = o.take<float>(T * HC, ok);
     m.xn16 = o.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); m.lo = o.take<float>(T * LR, ok); m.lo16 = o.take<uint16_t>(T * LR, ok);
-    m.gated = o.take<float>(T * D, ok); m.inj = o.take<float>(T * HC, ok);
+    m.gated = m.hc_scratch ? nullptr : o.take<float>(T * D, ok); m.inj = o.take<float>(T * HC, ok);
     m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
     m.mixed_h = o.take<uint16_t>(T * N, ok);
     // Embedding rows are dead after gr_broadcast on m.cs; subsequent half outputs use the same stream.
@@ -1628,15 +1665,23 @@ bool Prefill::carve(size_t T, void* alloc) {
     m.cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     m.max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     {
-        // one region for the attention half's and the MoE half's scratch (see gdn_set_bytes)
+        // HC (when enabled), attention and MoE own this region in order on m.cs.
         const bool fz = fused_layout(T, m.src != nullptr);
         m.fused_bufs = fz;
         const MoeBufs mb = moe_bufs(T, m.g->n_expert, fz);
         const uint64_t region = std::max({gdn_set_bytes(T), qsa_set_bytes(T, m.cap, m.max_blocks, m.sel_batch,
-                                                                           m.attn_batch, s), moe_set_bytes(T, m.g->n_expert, fz)});
+                                                                           m.attn_batch, s), moe_set_bytes(T, m.g->n_expert, fz), hc_bytes});
         uint8_t* base = o.take<uint8_t>((size_t) region, ok);
         m.region = base;
         m.region_bytes = region;
+        if (m.hc_scratch) {
+            // A null Alloc base would cudaMalloc instead of aliasing: fail closed.
+            if (base == nullptr) return false;
+            Alloc hc;
+            hc.base = base; hc.cap = region; hc.owned = &m.owned;
+            m.gated = hc.take<float>(T * D, ok);
+            if (m.gated != reinterpret_cast<float*>(base) || hc.used != hc_bytes) return false;
+        }
         Alloc a;
         a.base = base; a.cap = region; a.owned = &m.owned;
         m.qkv = a.take<float>(T * C, ok); m.z = a.take<float>(T * ZV, ok); m.ab = a.take<float>(T * 2 * HV, ok);
@@ -1709,11 +1754,23 @@ bool Prefill::carve(size_t T, void* alloc) {
     m.ple_norm = o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
     take_stage(o, ss, s, m.stage, ok);
     m.T = (int64_t) T;
+    if (ok && m.hc_scratch)
+        std::fprintf(stderr, "strata: prompt HC scratch requested=1 actual=shared chunk=%lld hc_bytes=%llu "
+                             "region_bytes=%llu planned_bytes=%llu carved_bytes=%llu\n",
+                     (long long) m.T, (unsigned long long) hc_bytes, (unsigned long long) m.region_bytes,
+                     (unsigned long long) bytes_needed(g, ss, m.T, m.src != nullptr), (unsigned long long) o.used);
     return ok;
 }
 
 bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err) {
     Impl& m = *impl_;
+    if (hc_scratch_requested() && (!m.hc_scratch || chunk <= 0 || hc_set_bytes((size_t) chunk) == 0 ||
+            !hc_scratch_active(m.g->n_expert, fused_layout((size_t) chunk, m.src != nullptr)) ||
+            stage_lb_ != 0 || stage_le_ != m.g->n_layers || next_ != nullptr || helper_ != nullptr ||
+            hand_in_ != nullptr || m.pp || m.help_pp)) {
+        err = "prefill: HC scratch no longer matches this layout; restart with a supported layout";
+        return false;
+    }
     if (m.borrow_spill) {
         err = "prefill: a hybrid borrowed/owned layout cannot be changed between requests";
         return false;
@@ -2385,6 +2442,9 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
                                     bool owned_pages, bool src) {
     // the same allocation sequence as `init` (`carve`), counted - with the MoE layout `carve` picks for the same source
     const size_t T = (size_t) chunk;
+    const bool hc_shared = hc_scratch_requested() && hc_scratch_active(g.n_expert, fused_layout(T, src));
+    const uint64_t hc_bytes = hc_shared ? hc_set_bytes(T) : 0;
+    if (hc_shared && hc_bytes == 0) return std::numeric_limits<uint64_t>::max();
     bool ok = true;
     Alloc o;
     o.count_only = true;
@@ -2405,7 +2465,8 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
         f(T * N); f(T * D); f(T * D);
     }
     o.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
-    f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok);
+    if (!hc_shared) f(T * D);
+    f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok);
     if (!emb_reuse_account()) f(T * N);   // bo: aliases emb in carve; still counted unless STRATA_EMB_REUSE_ACCOUNT=1
     const bool f16_io = prompt_f16();   // the current device's mode (the stage's), as Prefill::init will decide it
     if (bf16x2_hc(f16_io)) { o.take<uint16_t>(T * D, ok); o.take<uint16_t>(T * LR, ok); }
@@ -2415,7 +2476,7 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
-                                       moe_set_bytes(T, g.n_expert, fused_layout(T, src))}), ok);
+                                       moe_set_bytes(T, g.n_expert, fused_layout(T, src)), hc_bytes}), ok);
     for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
@@ -2641,6 +2702,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
+    if (hc_scratch_requested() && (!m.hc_scratch || !hc_scratch_active(g.n_expert, m.fused_bufs) ||
+            hc_set_bytes((size_t) m.T) == 0 || hc_set_bytes((size_t) m.T) > m.region_bytes ||
+            m.region == nullptr || m.gated != reinterpret_cast<float*>(m.region) ||
+            LB != 0 || LE != g.n_layers || next_ != nullptr || helper_ != nullptr ||
+            hand_in_ != nullptr || m.pp || m.help_pp)) {
+        err = "prefill: HC scratch no longer matches this execution layout; restart with a supported layout";
+        return false;
+    }
     if (m.expert_scratch && (!expert_scratch_active(g.n_expert, m.fused_bufs) || LB != 0 || LE != g.n_layers ||
                              next_ != nullptr || helper_ != nullptr || hand_in_ != nullptr || m.pp || m.help_pp)) {
         err = "prefill: expert-local scratch no longer matches this execution layout; restart with a supported layout";
